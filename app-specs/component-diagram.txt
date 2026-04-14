@@ -1,0 +1,186 @@
+┌──────────────────────────┐
+│        Client App        │
+│  Chat UI + Artifact UI   │
+│  Job UI + Connection UI  │
+└────────────┬─────────────┘
+             │
+             ▼
+┌──────────────────────────┐
+│     Agent API / BFF      │
+│ session-aware frontend   │
+│ orchestration endpoint   │
+└────────────┬─────────────┘
+             │
+             ▼
+┌──────────────────────────────────────────────────────────┐
+│                 Agent Orchestration Layer                │
+│ intent parsing │ skill selection │ artifact resolution   │
+│ tool planning  │ response composition │ turn state       │
+└───────┬───────────────┬───────────────────────┬──────────┘
+        │               │                       │
+        │               │                       │
+        ▼               ▼                       ▼
+┌───────────────┐ ┌───────────────┐   ┌───────────────────┐
+│ Session       │ │ Skill Registry│   │ Artifact Catalog  │
+│ Manager       │ │ + Skill Assets│   │ + Metadata Index  │
+│               │ │               │   │                   │
+│ sessions      │ │ versions      │   │ schemas           │
+│ turn state    │ │ triggers      │   │ lineage           │
+│ runtime refs  │ │ validations   │   │ previews          │
+│ job refs      │ │ templates     │   │ retention         │
+└───────┬───────┘ └───────────────┘   └─────────┬─────────┘
+        │                                        │
+        │                                        ▼
+        │                              ┌───────────────────┐
+        │                              │ Artifact Store    │
+        │                              │ object storage    │
+        │                              │ parquet/files     │
+        │                              └───────────────────┘
+        │
+        ▼
+┌──────────────────────────────────────────────────────────┐
+│                    Execution Manager                     │
+│ request validation │ policy routing │ runtime selection  │
+│ credential binding │ sync/async decision │ output capture│
+└───────┬──────────────────────┬─────────────────────┬─────┘
+        │                      │                     │
+        ▼                      ▼                     ▼
+┌───────────────┐    ┌────────────────┐    ┌──────────────────┐
+│ Connection    │    │ Runtime        │    │ Job Manager       │
+│ Registry      │    │ Registry       │    │ deferred jobs     │
+│ source defs   │    │ runtime defs   │    │ status/logs       │
+│ auth refs     │    │ images         │    │ retries           │
+│ policies      │    │ deps           │    │ completion events │
+│ attached skills│   │ isolation      │    └─────────┬────────┘
+└───────┬───────┘    └───────┬────────┘              │
+        │                    │                       │
+        ▼                    ▼                       ▼
+┌──────────────┐   ┌──────────────────────────────┐  │
+│ Secret       │   │ Runtime Pool / Provisioner   │◄─┘
+│ Manager      │   │ create/reuse runtime inst.   │
+│ tokens       │   │ session/task scoped binding  │
+└──────────────┘   └─────────────┬────────────────┘
+                                 │
+                ┌────────────────┼────────────────┐
+                │                │                │
+                ▼                ▼                ▼
+      ┌────────────────┐ ┌────────────────┐ ┌────────────────┐
+      │ SQL Runtime    │ │ Python Runtime │ │ Big Data Runtime│
+      │ query engine   │ │ dataframe/code │ │ spark/job env   │
+      │ temp views     │ │ artifact I/O   │ │ async heavy ops │
+      └────────────────┘ └────────────────┘ └────────────────┘
+
+External systems:
+- databases / warehouses
+- object stores / file stores
+- document sources
+- APIs
+
+
+Main responsibilities by component
+Client App
+
+Shows:
+
+chat
+saved artifacts
+job status
+exports
+connection browsing if allowed
+Agent API / BFF
+
+Acts as the app-facing gateway:
+
+receives user turns
+loads session context
+calls orchestration
+returns structured response payloads
+Agent Orchestration Layer
+
+Core reasoning layer:
+
+interprets the request
+chooses tools
+selects relevant skills
+resolves prior artifacts
+builds execution requests
+merges tool outputs into the answer
+Session Manager
+
+Owns session state:
+
+session metadata
+current turn context
+artifact references
+runtime bindings
+job references
+Skill Registry
+
+Stores skill packages:
+
+markdown guidance
+templates
+validations
+version metadata
+trigger metadata
+Artifact Catalog
+
+Stores metadata only:
+
+artifact identity
+schema
+lineage
+statistics
+preview metadata
+retention metadata
+Artifact Store
+
+Stores payloads:
+
+parquet
+files
+charts
+exported outputs
+Execution Manager
+
+Central control plane for execution:
+
+validates requests
+enforces connection/runtime policy
+resolves runtime type
+decides sync vs async
+injects credentials
+persists outputs
+Connection Registry
+
+Defines source access:
+
+endpoints
+source type
+allowed operations
+allowed runtime types
+auth refs
+attached skills
+Runtime Registry
+
+Defines runtime templates:
+
+image
+installed dependencies
+supported connectors
+resource profile
+isolation model
+Runtime Pool / Provisioner
+
+Starts or reuses live runtime instances.
+
+Job Manager
+
+Tracks deferred executions:
+
+submitted
+running
+failed
+completed
+logs
+output artifacts
