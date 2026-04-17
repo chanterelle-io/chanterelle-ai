@@ -22,7 +22,7 @@ runtime-sql:
 	PYTHONPATH=. uvicorn services.sql_runtime.app:app --port 8010 --reload
 
 seed:
-	PYTHONPATH=. python scripts/seed.py
+	PYTHONPATH=. python3 scripts/seed.py
 
 all-services:
 	@echo "Run each in a separate terminal:"
