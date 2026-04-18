@@ -1,4 +1,4 @@
-.PHONY: infra infra-down agent execution artifact runtime seed install
+.PHONY: infra infra-down agent execution artifact runtime-sql runtime-python seed install
 
 install:
 	pip install -e ".[dev]"
@@ -21,12 +21,25 @@ artifact:
 runtime-sql:
 	PYTHONPATH=. uvicorn services.sql_runtime.app:app --port 8010 --reload
 
+runtime-python:
+	PYTHONPATH=. uvicorn services.python_runtime.app:app --port 8011 --reload
+
 seed:
 	PYTHONPATH=. python3 scripts/seed.py
+
+migrate-phase2:
+	PYTHONPATH=. python3 scripts/migrate_phase2.py
+
+migrate-phase3:
+	PYTHONPATH=. python3 scripts/migrate_phase3.py
+
+migrate-phase4:
+	PYTHONPATH=. python3 scripts/migrate_phase4.py
 
 all-services:
 	@echo "Run each in a separate terminal:"
 	@echo "  make artifact"
 	@echo "  make runtime-sql"
+	@echo "  make runtime-python"
 	@echo "  make execution"
 	@echo "  make agent"

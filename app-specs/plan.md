@@ -298,6 +298,11 @@ User requests a wide date-range analysis. Policy routes to deferred. Job is crea
 
 - Skills at workspace, domain, and session levels
 - Session-level skill learning (user preferences inferred during conversation)
+- **Tool-based skill pull:** Replace full-injection with a two-tier model:
+  - System prompt includes only skill name + one-line summary for all matched skills (~50 tokens each)
+  - New `get_skill_guidance(skill_name)` tool returns full instructions (recommended steps, dos/donts, output expectations) on demand
+  - LLM decides if/when it needs detailed guidance — simple questions skip the tool entirely
+  - Scales to hundreds of skills without prompt bloat or mandatory extra latency
 
 ### 7.3 Workspace-level governance
 

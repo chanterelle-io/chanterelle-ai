@@ -29,6 +29,7 @@ class ExpectedOutput(BaseModel):
 class ExecutionRequest(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     session_id: str
+    user_id: str | None = None
     tool: ToolInvocation
     target: ExecutionTarget | None = None
     input_artifacts: list[ExecutionArtifactInput] = []
@@ -38,6 +39,7 @@ class ExecutionRequest(BaseModel):
 
 class ExecutionResult(BaseModel):
     execution_id: str
-    status: str  # "success" | "error"
+    status: str  # "success" | "error" | "denied"
     artifact_ids: list[str] = []
     error_message: str | None = None
+    policy_evaluation: dict | None = None

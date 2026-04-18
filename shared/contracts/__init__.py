@@ -18,3 +18,25 @@ from shared.contracts.execution import (
     ExecutionArtifactInput,
     ExpectedOutput,
 )
+from shared.contracts.runtime import RuntimeRecord
+from shared.contracts.skill import (
+    SkillRecord,
+    SkillCategory,
+    SkillScope,
+    SkillTrigger,
+    SkillInstructions,
+)
+from shared.contracts.policy import (
+    PolicyRecord,
+    PolicyType,
+    PolicyStatus,
+    PolicyScope,
+    PolicyCondition,
+    PolicyEffect,
+    PolicyEvaluation,
+)
+from shared.contracts.topic import (
+    TopicProfile,
+    UserTopicAssignment,
+    ResolvedTopicContext,
+)

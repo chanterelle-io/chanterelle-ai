@@ -15,19 +15,24 @@ from services.agent.llm.base import (
 )
 from services.agent.session import Session, SessionStore
 from services.agent.tools.sql_query import SQL_QUERY_TOOL
+from services.agent.tools.python_transform import PYTHON_TRANSFORM_TOOL
+from services.agent.tools.inspect_artifact import INSPECT_ARTIFACT_TOOL
 from shared.contracts.connection import ConnectionRecord
 from shared.contracts.execution import (
     ExecutionRequest,
     ExecutionResult,
     ExecutionTarget,
+    ExecutionArtifactInput,
     ExpectedOutput,
     ToolInvocation,
 )
+from shared.contracts.skill import SkillRecord
+from shared.contracts.topic import ResolvedTopicContext
 from shared.settings import settings
 
 logger = logging.getLogger(__name__)
 
-MAX_TOOL_ROUNDS = 5
+MAX_TOOL_ROUNDS = 15
 
 
 class Orchestrator:
@@ -35,15 +40,40 @@ class Orchestrator:
         self.llm = llm
         self.sessions = SessionStore()
 
-    async def handle_message(self, session_id: str, user_message: str) -> dict:
+    async def handle_message(self, session_id: str, user_message: str, user_id: str | None = None) -> dict:
         session = self.sessions.get_or_create(session_id)
+
+        # Resolve topic context if user_id is provided
+        topic_context = None
+        if user_id:
+            topic_context = await self._fetch_topic_context(user_id)
 
         # Gather context for the system prompt
         connections = await self._fetch_connections()
         artifacts = await self._fetch_session_artifacts(session_id)
 
-        system_prompt = self._build_system_prompt(connections, artifacts)
-        tools = [SQL_QUERY_TOOL]
+        # Filter connections by topic profile
+        if topic_context and topic_context.allowed_connection_names:
+            connections = [
+                c for c in connections
+                if c.name in topic_context.allowed_connection_names
+            ]
+
+        connection_names = [c.name for c in connections]
+        skills = await self._fetch_skills(connection_names, user_message)
+
+        # Filter skills by topic profile
+        if topic_context and topic_context.active_skill_ids:
+            skills = [s for s in skills if s.id in topic_context.active_skill_ids]
+
+        system_prompt = self._build_system_prompt(connections, artifacts, skills, topic_context)
+
+        # Build tool list, filtered by topic profile
+        all_tools = [SQL_QUERY_TOOL, PYTHON_TRANSFORM_TOOL, INSPECT_ARTIFACT_TOOL]
+        if topic_context and topic_context.allowed_tool_names:
+            tools = [t for t in all_tools if t.name in topic_context.allowed_tool_names]
+        else:
+            tools = all_tools
 
         # Add user message
         session.messages.append({"role": "user", "content": user_message})
@@ -71,7 +101,7 @@ class Orchestrator:
             # Execute each tool call
             tool_results: list[ToolResult] = []
             for tc in response.tool_calls:
-                result_text, artifact_id = await self._execute_tool(session, tc)
+                result_text, artifact_id = await self._execute_tool(session, tc, user_id=user_id)
                 tool_results.append(ToolResult(tool_call_id=tc.id, content=result_text))
                 if artifact_id:
                     new_artifact_ids.append(artifact_id)
@@ -91,6 +121,9 @@ class Orchestrator:
                 "content": "I reached the maximum number of tool steps. Here is what I have so far.",
             })
 
+        # Persist session state
+        self.sessions.save(session)
+
         return {
             "session_id": session_id,
             "message": session.messages[-1]["content"],
@@ -100,14 +133,18 @@ class Orchestrator:
     # --- Tool execution ---
 
     async def _execute_tool(
-        self, session: Session, tool_call: ToolCall
+        self, session: Session, tool_call: ToolCall, user_id: str | None = None,
     ) -> tuple[str, str | None]:
         if tool_call.name == "query_sql_source":
-            return await self._execute_sql_query(session, tool_call.input)
+            return await self._execute_sql_query(session, tool_call.input, user_id=user_id)
+        if tool_call.name == "transform_with_python":
+            return await self._execute_python_transform(session, tool_call.input, user_id=user_id)
+        if tool_call.name == "inspect_artifact":
+            return await self._execute_inspect_artifact(session, tool_call.input)
         return f"Unknown tool: {tool_call.name}", None
 
     async def _execute_sql_query(
-        self, session: Session, tool_input: dict
+        self, session: Session, tool_input: dict, user_id: str | None = None,
     ) -> tuple[str, str | None]:
         connection_name = tool_input.get("connection_name", "")
         query = tool_input.get("query", "")
@@ -115,6 +152,7 @@ class Orchestrator:
 
         exec_request = ExecutionRequest(
             session_id=session.id,
+            user_id=user_id,
             tool=ToolInvocation(
                 tool_name="query_sql",
                 operation="query",
@@ -137,6 +175,8 @@ class Orchestrator:
         result = ExecutionResult(**resp.json())
         if result.status == "error":
             return f"Query failed: {result.error_message}", None
+        if result.status == "denied":
+            return f"Query denied by policy: {result.error_message}", None
 
         # Fetch artifact metadata for the summary
         artifact_id = result.artifact_ids[0] if result.artifact_ids else None
@@ -145,6 +185,112 @@ class Orchestrator:
             return summary, artifact_id
 
         return "Query executed but no artifact was produced.", None
+
+    async def _execute_python_transform(
+        self, session: Session, tool_input: dict, user_id: str | None = None,
+    ) -> tuple[str, str | None]:
+        code = tool_input.get("code", "")
+        input_artifact_names = tool_input.get("input_artifacts", [])
+        artifact_name = tool_input.get("artifact_name", "transform_result")
+
+        # Resolve artifact names to IDs
+        all_artifacts = await self._fetch_session_artifacts(session.id)
+        artifact_map = {a["name"]: a["id"] for a in all_artifacts}
+        input_refs = []
+        for name in input_artifact_names:
+            aid = artifact_map.get(name)
+            if not aid:
+                return f"Artifact '{name}' not found in this session.", None
+            input_refs.append(ExecutionArtifactInput(artifact_id=aid, alias=name))
+
+        exec_request = ExecutionRequest(
+            session_id=session.id,
+            user_id=user_id,
+            tool=ToolInvocation(
+                tool_name="python_transform",
+                operation="transform",
+                payload={"code": code},
+            ),
+            input_artifacts=input_refs,
+            expected_outputs=[ExpectedOutput(name=artifact_name, type="table")],
+        )
+
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.post(
+                f"{settings.execution_service_url}/execute",
+                json=exec_request.model_dump(),
+            )
+
+        if resp.status_code != 200:
+            error_detail = resp.json().get("detail", resp.text)
+            return f"Error executing transform: {error_detail}", None
+
+        result = ExecutionResult(**resp.json())
+        if result.status == "error":
+            return f"Transform failed: {result.error_message}", None
+        if result.status == "denied":
+            return f"Transform denied by policy: {result.error_message}", None
+
+        artifact_id = result.artifact_ids[0] if result.artifact_ids else None
+        if artifact_id:
+            summary = await self._get_artifact_summary(artifact_id)
+            return summary, artifact_id
+
+        return "Transform executed but no artifact was produced.", None
+
+    async def _execute_inspect_artifact(
+        self, session: Session, tool_input: dict
+    ) -> tuple[str, str | None]:
+        artifact_name = tool_input.get("artifact_name", "")
+        max_rows = min(tool_input.get("max_rows", 5), 20)  # cap at 20
+
+        # Resolve artifact name to ID
+        all_artifacts = await self._fetch_session_artifacts(session.id)
+        artifact = None
+        for a in all_artifacts:
+            if a["name"] == artifact_name:
+                artifact = a
+                break
+        if not artifact:
+            return f"Artifact '{artifact_name}' not found in this session.", None
+
+        artifact_id = artifact["id"]
+
+        # Get metadata
+        schema = artifact.get("schema_info") or {}
+        columns = schema.get("columns", [])
+        stats = artifact.get("statistics") or {}
+        row_count = stats.get("row_count", "?")
+
+        # Download and read sample rows
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.get(
+                    f"{settings.artifact_service_url}/artifacts/{artifact_id}/download"
+                )
+                resp.raise_for_status()
+
+            import io
+            import pyarrow.parquet as pq
+
+            buf = io.BytesIO(resp.content)
+            table = pq.read_table(buf)
+            df = table.to_pandas()
+            sample = df.head(max_rows)
+            sample_str = sample.to_csv(index=False)
+        except Exception as e:
+            logger.warning("Failed to download artifact for inspection: %s", e)
+            sample_str = "(Could not load sample rows)"
+
+        col_details = "\n".join(
+            f"  - {c['name']} ({c.get('logical_type', '?')})" for c in columns
+        )
+
+        return (
+            f"**Artifact: {artifact_name}** ({row_count} rows, {len(columns)} columns)\n\n"
+            f"Columns:\n{col_details}\n\n"
+            f"Sample rows (first {max_rows}):\n{sample_str}"
+        ), None
 
     async def _get_artifact_summary(self, artifact_id: str) -> str:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -196,14 +342,55 @@ class Orchestrator:
             logger.warning("Failed to fetch artifacts: %s", e)
             return []
 
+    async def _fetch_skills(
+        self, connection_names: list[str], user_message: str
+    ) -> list[SkillRecord]:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    f"{settings.execution_service_url}/skills/resolve",
+                    params={
+                        "connection_names": ",".join(connection_names) if connection_names else "",
+                        "user_message": user_message,
+                    },
+                )
+                resp.raise_for_status()
+            return [SkillRecord(**s) for s in resp.json()]
+        except Exception as e:
+            logger.warning("Failed to fetch skills: %s", e)
+            return []
+
+    async def _fetch_topic_context(self, user_id: str) -> ResolvedTopicContext | None:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    f"{settings.execution_service_url}/topics/resolve",
+                    params={"user_id": user_id},
+                )
+                resp.raise_for_status()
+            ctx = ResolvedTopicContext(**resp.json())
+            if ctx.profiles:
+                logger.info(
+                    "Topic context for user %s: %s",
+                    user_id, [p.name for p in ctx.profiles],
+                )
+            return ctx if ctx.profiles else None
+        except Exception as e:
+            logger.warning("Failed to fetch topic context: %s", e)
+            return None
+
     # --- Prompt building ---
 
     def _build_system_prompt(
-        self, connections: list[ConnectionRecord], artifacts: list[dict]
+        self, connections: list[ConnectionRecord], artifacts: list[dict],
+        skills: list[SkillRecord] | None = None,
+        topic_context: ResolvedTopicContext | None = None,
     ) -> str:
         parts = [
             "You are an analytics agent. You help users retrieve and analyze data from connected sources.",
             "You write SQL queries to fetch data, and results are saved as reusable table artifacts in the session.",
+            "You can also transform data using Python code that operates on previously created artifacts.",
+            "You can inspect existing artifacts to see sample rows and column details.",
             "",
             "## Available connections",
         ]
@@ -233,10 +420,54 @@ class Orchestrator:
             "## Instructions",
             "- When the user asks for data, determine the right connection and write a SQL query.",
             "- Use the query_sql_source tool to execute queries.",
+            "- Use the transform_with_python tool to filter, aggregate, or transform existing artifacts.",
+            "- When using transform_with_python, input artifacts are available as pandas DataFrames with the variable names matching the artifact aliases.",
+            "- Your code must assign the final result to a variable called `result` (a DataFrame).",
+            "- Use the inspect_artifact tool to look at sample rows or column details of an existing artifact.",
             "- Give artifacts clear, descriptive snake_case names.",
             "- After getting results, summarize what was found.",
             "- You can reference prior artifacts by name when the user asks follow-up questions.",
+            "- When the user wants to refine or filter a prior result, prefer transform_with_python over re-querying the source.",
+            "- Be efficient: combine multiple calculations into a single query when possible rather than running separate queries for each metric.",
+            "- Only use inspect_artifact when you genuinely need to see data values. You already get column names and row counts from query results.",
         ])
+
+        # Active skills
+        if skills:
+            parts.append("")
+            parts.append("## Active skills")
+            for skill in skills:
+                parts.append(f"### {skill.title or skill.name} ({skill.category.value})")
+                parts.append(skill.instructions.summary)
+                if skill.instructions.recommended_steps:
+                    parts.append("Recommended steps:")
+                    for step in skill.instructions.recommended_steps:
+                        parts.append(f"  - {step}")
+                if skill.instructions.dos:
+                    parts.append("Do:")
+                    for do in skill.instructions.dos:
+                        parts.append(f"  - {do}")
+                if skill.instructions.donts:
+                    parts.append("Don't:")
+                    for dont in skill.instructions.donts:
+                        parts.append(f"  - {dont}")
+                if skill.instructions.output_expectations:
+                    parts.append("Expected output:")
+                    for exp in skill.instructions.output_expectations:
+                        parts.append(f"  - {exp}")
+                parts.append("")
+
+        # Topic profile context
+        if topic_context and topic_context.profiles:
+            parts.append("")
+            parts.append("## Active topic profiles")
+            for profile in topic_context.profiles:
+                parts.append(f"- **{profile.display_name or profile.name}**: {profile.description or ''}")
+            if topic_context.allowed_tool_names:
+                parts.append(f"\nYou may only use these tools: {', '.join(topic_context.allowed_tool_names)}")
+            if topic_context.allowed_connection_names:
+                parts.append(f"You may only access these connections: {', '.join(topic_context.allowed_connection_names)}")
+            parts.append("")
 
         return "\n".join(parts)
 

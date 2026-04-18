@@ -22,4 +22,6 @@ class ConnectionRecord(BaseModel):
     type: str  # "sqlite" | "postgresql" | ...
     status: str = "active"
     config: ConnectionConfig = ConnectionConfig()
+    auth_method: str | None = None  # username_password | access_token | secret_ref | ...
+    auth_config: dict = {}  # refs to secrets, NOT plaintext credentials
     created_at: datetime | None = None

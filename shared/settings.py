@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     execution_service_url: str = "http://localhost:8001"
     artifact_service_url: str = "http://localhost:8002"
     sql_runtime_url: str = "http://localhost:8010"
+    python_runtime_url: str = "http://localhost:8011"
 
     model_config = {"env_prefix": "CHANTERELLE_", "env_file": ".env"}
 
