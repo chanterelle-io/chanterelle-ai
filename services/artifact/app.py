@@ -1,8 +1,10 @@
 import logging
+import io
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
+import pyarrow.parquet as pq
 
-from shared.contracts.artifact import ArtifactRecord, CreateArtifactRequest
+from shared.contracts.artifact import ArtifactPreview, ArtifactRecord, CreateArtifactRequest
 from services.artifact.catalog import ArtifactCatalog
 from services.artifact.store import ArtifactStore
 
@@ -32,8 +34,14 @@ async def upload_artifact_data(artifact_id: str, request: Request) -> dict:
     key = f"{record.session_id}/{artifact_id}.parquet"
     uri = store.upload(key, data)
     size_bytes = len(data)
+    preview = _build_preview(data)
 
-    catalog.update_storage(artifact_id, storage_uri=uri, size_bytes=size_bytes)
+    catalog.update_storage(
+        artifact_id,
+        storage_uri=uri,
+        size_bytes=size_bytes,
+        preview=preview,
+    )
     logger.info("Uploaded %d bytes for artifact %s", size_bytes, artifact_id)
     return {"storage_uri": uri, "size_bytes": size_bytes}
 
@@ -62,3 +70,14 @@ def download_artifact_data(artifact_id: str) -> Response:
 @app.get("/artifacts", response_model=list[ArtifactRecord])
 def list_artifacts(session_id: str = Query(...)) -> list[ArtifactRecord]:
     return catalog.list_by_session(session_id)
+
+
+def _build_preview(data: bytes, row_limit: int = 5) -> ArtifactPreview | None:
+    try:
+        table = pq.read_table(io.BytesIO(data))
+        sample_rows = table.slice(0, row_limit).to_pylist()
+    except Exception as exc:
+        logger.warning("Failed to generate preview rows: %s", exc)
+        return None
+
+    return ArtifactPreview(sample_rows=sample_rows, row_limit=row_limit)

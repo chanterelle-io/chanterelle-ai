@@ -299,26 +299,31 @@ class Orchestrator:
         columns = schema.get("columns", [])
         stats = artifact.get("statistics") or {}
         row_count = stats.get("row_count", "?")
+        preview = artifact.get("preview") or {}
+        preview_rows = preview.get("sample_rows") or []
 
         # Download and read sample rows
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.get(
-                    f"{settings.artifact_service_url}/artifacts/{artifact_id}/download"
-                )
-                resp.raise_for_status()
+        if preview_rows and max_rows <= len(preview_rows):
+            sample_str = self._rows_to_csv(preview_rows[:max_rows])
+        else:
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    resp = await client.get(
+                        f"{settings.artifact_service_url}/artifacts/{artifact_id}/download"
+                    )
+                    resp.raise_for_status()
 
-            import io
-            import pyarrow.parquet as pq
+                import io
+                import pyarrow.parquet as pq
 
-            buf = io.BytesIO(resp.content)
-            table = pq.read_table(buf)
-            df = table.to_pandas()
-            sample = df.head(max_rows)
-            sample_str = sample.to_csv(index=False)
-        except Exception as e:
-            logger.warning("Failed to download artifact for inspection: %s", e)
-            sample_str = "(Could not load sample rows)"
+                buf = io.BytesIO(resp.content)
+                table = pq.read_table(buf)
+                df = table.to_pandas()
+                sample = df.head(max_rows)
+                sample_str = sample.to_csv(index=False)
+            except Exception as e:
+                logger.warning("Failed to download artifact for inspection: %s", e)
+                sample_str = "(Could not load sample rows)"
 
         col_details = "\n".join(
             f"  - {c['name']} ({c.get('logical_type', '?')})" for c in columns
@@ -329,6 +334,21 @@ class Orchestrator:
             f"Columns:\n{col_details}\n\n"
             f"Sample rows (first {max_rows}):\n{sample_str}"
         ), None, False
+
+    def _rows_to_csv(self, rows: list[dict[str, Any]]) -> str:
+        if not rows:
+            return ""
+
+        import csv
+        import io
+
+        fieldnames = list(rows[0].keys())
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+        return buf.getvalue()
 
     async def _execute_check_job_status(
         self, session: Session, tool_input: dict

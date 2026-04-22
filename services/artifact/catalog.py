@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import text
 
 from shared.contracts.artifact import (
+    ArtifactPreview,
     ArtifactRecord,
     ArtifactStatus,
     CreateArtifactRequest,
@@ -68,23 +70,37 @@ class ArtifactCatalog:
 
         return [self._row_to_record(r) for r in rows]
 
-    def update_storage(self, artifact_id: str, storage_uri: str, size_bytes: int) -> None:
+    def update_storage(
+        self,
+        artifact_id: str,
+        storage_uri: str,
+        size_bytes: int,
+        preview: ArtifactPreview | None = None,
+    ) -> None:
         engine = get_engine()
 
         with engine.connect() as conn:
             conn.execute(
                 text("""
                     UPDATE artifacts
-                    SET storage_uri = :uri, size_bytes = :size, updated_at = NOW()
+                    SET storage_uri = :uri,
+                        size_bytes = :size,
+                        extra_metadata = :extra_metadata,
+                        updated_at = NOW()
                     WHERE id = :id
                 """),
-                {"uri": storage_uri, "size": size_bytes, "id": artifact_id},
+                {
+                    "uri": storage_uri,
+                    "size": size_bytes,
+                    "extra_metadata": json.dumps(
+                        {"preview": preview.model_dump()} if preview else {}
+                    ),
+                    "id": artifact_id,
+                },
             )
             conn.commit()
 
     def _row_to_record(self, row) -> ArtifactRecord:
-        import json
-
         schema_info = None
         if row["schema_info"]:
             raw = row["schema_info"]
@@ -100,6 +116,14 @@ class ArtifactCatalog:
             raw = row["lineage"]
             lineage = json.loads(raw) if isinstance(raw, str) else raw
 
+        preview = None
+        extra_metadata = row.get("extra_metadata")
+        if extra_metadata:
+            raw = json.loads(extra_metadata) if isinstance(extra_metadata, str) else extra_metadata
+            preview_data = raw.get("preview")
+            if preview_data:
+                preview = ArtifactPreview(**preview_data)
+
         return ArtifactRecord(
             id=str(row["id"]),
             session_id=row["session_id"],
@@ -112,6 +136,7 @@ class ArtifactCatalog:
             size_bytes=row["size_bytes"],
             schema_info=schema_info,
             statistics=statistics,
+            preview=preview,
             lineage=lineage,
             retention_class=row["retention_class"],
             created_at=row["created_at"],

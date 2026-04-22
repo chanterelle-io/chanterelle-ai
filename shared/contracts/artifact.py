@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import Any
 import uuid
 from datetime import datetime
 from enum import Enum
@@ -44,6 +45,11 @@ class ArtifactStatistics(BaseModel):
     byte_size: int | None = None
 
 
+class ArtifactPreview(BaseModel):
+    sample_rows: list[dict[str, Any]]
+    row_limit: int = 5
+
+
 class ArtifactLineage(BaseModel):
     source_kind: str  # "connected_source" | "derived" | "uploaded"
     parent_artifact_ids: list[str] = []
@@ -76,6 +82,7 @@ class ArtifactRecord(BaseModel):
     size_bytes: int | None = None
     schema_info: TableSchema | None = None
     statistics: ArtifactStatistics | None = None
+    preview: ArtifactPreview | None = None
     lineage: ArtifactLineage | None = None
     retention_class: RetentionClass = RetentionClass.TEMPORARY
     created_at: datetime = Field(default_factory=datetime.utcnow)
