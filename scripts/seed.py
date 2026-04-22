@@ -307,9 +307,9 @@ def seed_policies() -> None:
         {
             "name": "large_query_advisory",
             "type": "execution_routing",
-            "description": "Flag queries that might return large result sets.",
+            "description": "Defer queries against large source tables without a WHERE or LIMIT clause.",
             "scope": json.dumps({"level": "global"}),
-            "condition": json.dumps({"estimated_row_count_above": 10000}),
+            "condition": json.dumps({"max_source_table_rows_above": 100, "query_has_no_limit": True}),
             "effect": json.dumps({"force_execution_mode": "deferred"}),
             "priority": 5,
             "tags": json.dumps(["performance"]),

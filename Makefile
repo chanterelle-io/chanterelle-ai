@@ -36,6 +36,9 @@ migrate-phase3:
 migrate-phase4:
 	PYTHONPATH=. python3 scripts/migrate_phase4.py
 
+migrate-phase5:
+	PYTHONPATH=. python3 scripts/migrate_phase5.py
+
 all-services:
 	@echo "Run each in a separate terminal:"
 	@echo "  make artifact"

@@ -124,3 +124,21 @@ CREATE TABLE IF NOT EXISTS user_topic_assignments (
 
 CREATE INDEX IF NOT EXISTS idx_user_topic_user ON user_topic_assignments(user_id);
 CREATE INDEX IF NOT EXISTS idx_user_topic_profile ON user_topic_assignments(topic_profile_id);
+
+-- Phase 5: Jobs
+CREATE TABLE IF NOT EXISTS jobs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id VARCHAR(255) NOT NULL,
+    user_id VARCHAR(255),
+    status VARCHAR(50) NOT NULL DEFAULT 'submitted',
+    execution_request JSONB NOT NULL DEFAULT '{}',
+    result JSONB,
+    logs JSONB NOT NULL DEFAULT '[]',
+    error_message TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_jobs_session ON jobs(session_id);
+CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);

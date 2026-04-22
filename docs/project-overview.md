@@ -5,7 +5,7 @@ Analytics Agent Platform — session-based analytical workspace where a user int
 
 ## Architecture
 - **Agent Service** (port 8000): Orchestration, LLM tool-use loop, session management
-- **Execution Service** (port 8001): Execution request validation, connection registry, runtime registry, skill registry, policy registry, topic profile registry, policy evaluation, policy registry, topic profile registry, policy evaluation, runtime routing, credential injection
+- **Execution Service** (port 8001): Execution request validation, connection registry, runtime registry, skill registry, policy registry, topic profile registry, policy evaluation, runtime routing, credential injection, query analysis, deferred execution (job manager)
 - **Artifact Service** (port 8002): Artifact catalog (Postgres), object storage (MinIO/S3), Parquet persistence
 - **SQL Runtime** (port 8010): Executes SQL against connected sources, returns Parquet
 - **Python Runtime** (port 8011): Executes Python transforms on DataFrames, returns Parquet
@@ -27,18 +27,16 @@ Analytics Agent Platform — session-based analytical workspace where a user int
 - Execution service routes to runtimes by tool type (SQL → sql runtime, Python → python runtime)
 - Policies evaluated at execution time — can deny tools/runtimes, force deferred mode, require approval
 - Topic profiles scope what tools, connections, and skills a user can access
-- Policies evaluated at execution time — can deny tools/runtimes, force deferred mode, require approval
-- Topic profiles scope what tools, connections, and skills a user can access
+- Deferred execution: server-side query analysis triggers background jobs for large/unbounded queries
+- Policy conditions are server-side only — agent hints are optional fallback, not the source of truth
 - Sessions persisted in Postgres (messages + artifact refs as JSONB)
 
 ## Commands
 - `make infra` — start Postgres + MinIO + seed policies + seed topic profiles + seed user assignments
 - `make migrate-phase2` — add sessions + runtimes tables to existing DB
 - `make migrate-phase3` — add skills table + connection auth columns to existing DB
-- `make migrate-phase4` — add policies, topic_profiles, user_topic_assignments tableister runtimes + seed skills + seed policies + seed topic profiles + seed user assignments
-- `make migrate-phase2` — add sessions + runtimes tables to existing DB
-- `make migrate-phase3` — add skills table + connection auth columns to existing DB
 - `make migrate-phase4` — add policies, topic_profiles, user_topic_assignments tables to existing DB
+- `make migrate-phase5` — add jobs table to existing DB
 - `make artifact` / `make runtime-sql` / `make runtime-python` / `make execution` / `make agent` — start each service
 - `make infra-down` — stop infrastructure
 

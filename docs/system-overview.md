@@ -48,17 +48,17 @@ User sees summary                  Artifact available
 
 The brain. Receives user messages, talks to the LLM, decides which tools to use, and composes the response.
 
-On If a `user_id` is provided, resolves the user's **topic profiles** — which tools, connections, and skills they're allowed to use
+On each turn:
+1. Loads the session (or creates a new one)
+2. If a `user_id` is provided, resolves the user's **topic profiles** — which tools, connections, and skills they're allowed to use
 3. Filters connections and fetches applicable skills (scoped by topic profile if active)
 4. Builds a system prompt with connections, artifacts, skill instructions, and topic constraints
 5. Sends the conversation to the LLM (only the tools allowed by the topic profile)
 6. If the LLM calls a tool (e.g. `query_sql_source`, `transform_with_python`, or `inspect_artifact`), the agent executes it by calling the Execution Service or Artifact Service
-7. Feeds the tool result back to the LLM (including policy denial messages if blocked)
-8. Returns the LLM's final response to the user
-9. If the LLM calls a tool (e.g. `query_sql_source`, `transform_with_python`, or `inspect_artifact`), the agent executes it by calling the Execution Service or Artifact Service
-7. Feeds the tool result back to the LLM (including policy denial messages if blocked)
-8. Returns the LLM's final response to the user
-9. Persists the updated session (messages + artifact references) to Postgres
+7. Feeds the tool result back to the LLM (including policy denial or deferred messages)
+8. If the execution was deferred, the agent stops the tool loop and reports the job ID to the user
+9. Returns the LLM's final response to the user
+10. Persists the updated session (messages + artifact references) to Postgres
 
 The LLM provider is abstracted — currently Claude, swappable to any provider by implementing the `LLMProvider` interface.
 
@@ -66,6 +66,7 @@ The LLM provider is abstracted — currently Claude, swappable to any provider b
 - `query_sql_source` — execute SQL against a connected data source
 - `transform_with_python` — run Python code on existing artifacts (loaded as pandas DataFrames)
 - `inspect_artifact` — read sample rows and column details from an existing artifact without re-querying
+- `check_job_status` — check the status of a deferred background job
 
 ### Execution Service (port 8001)
 
@@ -103,7 +104,7 @@ It answers questions like: "What artifacts exist?", "What columns does `customer
 The worker. Receives a SQL query + connection config, executes it against the actual data source, and returns the result as Parquet bytes.
 
 Currently supports SQLite and PostgreSQL. The runtime is stateless — it doesn't store results or track sessions. It just runs queries and returns data.
-
+Also exposes a `POST /analyze` endpoint for lightweight query analysis — extracts source table names, looks up row counts (SQLite: `COUNT(*)` per table; PostgreSQL: `pg_stat_user_tables.n_live_tup`), and detects WHERE/LIMIT clauses. This is used by the Execution Service for policy evaluation without running the actual query.
 ### Python Runtime (port 8011)
 
 The transformer. Receives Python code + input artifacts (as base64-encoded Parquet), loads them as pandas DataFrames, executes the code, and returns the result as Parquet bytes.
@@ -135,23 +136,7 @@ A skill is domain-specific guidance injected into the agent's prompt. Skills are
 
 Skills have:
 - **Category** — connector, metric, workflow, domain, or compliance
-- # Policies
-
-A policy is a rule evaluated at execution time. Policies have a **type** (execution_routing, tool_selection, validation, security), a **scope** (global or linked to specific topic profiles), a **condition** (when to trigger), and an **effect** (what happens).
-
-Effects include: denying specific tools or runtimes, forcing deferred execution mode, requiring approval before running. Policies are evaluated by the Execution Service before any runtime is called — they can block execution entirely.
-
-Policies are prioritized. Higher-priority policies take precedence when effects conflict.
-
-### Topic Profiles
-
-A topic profile defines a scoped workspace: which tools, connections, runtimes, skills, and policies are available. Users are assigned to one or more topic profiles. When the agent receives a request with a `user_id`, it resolves the user's active profiles and restricts everything accordingly.
-
-If no `user_id` is provided, the agent operates with full access (backward compatible).
-
-Examples: "Finance Analysis" (SQL + inspect only, sample_db connection, no Python), "General Exploration" (all tools, all connections, all skills).
-
-##**Scope** — global (always active), connection-scoped (active when a specific connection is involved), or keyword-triggered
+- **Scope** — global (always active), connection-scoped (active when a specific connection is involved), or keyword-triggered
 - **Instructions** — summary, recommended steps, dos/donts, output expectations
 
 Examples: "Sample DB Schema Guide" (connector skill — tells the agent the table structure), "Customer Churn Analysis" (metric skill — defines how to calculate churn, triggered by keywords like "churn" or "retention").
@@ -160,9 +145,17 @@ Examples: "Sample DB Schema Guide" (connector skill — tells the agent the tabl
 
 A policy is a rule evaluated at execution time. Policies have a **type** (execution_routing, tool_selection, validation, security), a **scope** (global or linked to specific topic profiles), a **condition** (when to trigger), and an **effect** (what happens).
 
-Effects include: denying specific tools or runtimes, forcing deferred execution mode, requiring approval before running. Policies are evaluated by the Execution Service before any runtime is called — they can block execution entirely.
+Conditions can check: source types, tool names, estimated row counts, max source table rows, and query patterns (has WHERE, has LIMIT). All conditions on a policy are AND’d — all must be met for the effect to apply.
+
+Effects include: denying specific tools or runtimes, forcing deferred execution mode, requiring approval before running. Policies are evaluated by the Execution Service before any runtime is called — they can block or defer execution entirely.
 
 Policies are prioritized. Higher-priority policies take precedence when effects conflict.
+
+### Deferred Execution (Jobs)
+
+When a policy forces deferred execution (e.g., a large unbounded query), the Execution Service creates a job record, launches the execution in the background, and returns a job ID immediately. The agent reports the deferral to the user, who can check status later via the `check_job_status` tool.
+
+Job states: submitted → running → completed/failed. Jobs store the original execution request, result, logs, and error messages.
 
 ### Topic Profiles
 

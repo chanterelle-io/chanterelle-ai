@@ -39,7 +39,8 @@ class ExecutionRequest(BaseModel):
 
 class ExecutionResult(BaseModel):
     execution_id: str
-    status: str  # "success" | "error" | "denied"
+    status: str  # "success" | "error" | "denied" | "deferred"
     artifact_ids: list[str] = []
     error_message: str | None = None
     policy_evaluation: dict | None = None
+    job_id: str | None = None

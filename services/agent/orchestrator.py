@@ -17,6 +17,7 @@ from services.agent.session import Session, SessionStore
 from services.agent.tools.sql_query import SQL_QUERY_TOOL
 from services.agent.tools.python_transform import PYTHON_TRANSFORM_TOOL
 from services.agent.tools.inspect_artifact import INSPECT_ARTIFACT_TOOL
+from services.agent.tools.check_job import CHECK_JOB_STATUS_TOOL
 from shared.contracts.connection import ConnectionRecord
 from shared.contracts.execution import (
     ExecutionRequest,
@@ -69,9 +70,13 @@ class Orchestrator:
         system_prompt = self._build_system_prompt(connections, artifacts, skills, topic_context)
 
         # Build tool list, filtered by topic profile
-        all_tools = [SQL_QUERY_TOOL, PYTHON_TRANSFORM_TOOL, INSPECT_ARTIFACT_TOOL]
+        all_tools = [SQL_QUERY_TOOL, PYTHON_TRANSFORM_TOOL, INSPECT_ARTIFACT_TOOL, CHECK_JOB_STATUS_TOOL]
         if topic_context and topic_context.allowed_tool_names:
-            tools = [t for t in all_tools if t.name in topic_context.allowed_tool_names]
+            # Always include check_job_status regardless of topic profile
+            tools = [
+                t for t in all_tools
+                if t.name in topic_context.allowed_tool_names or t.name == "check_job_status"
+            ]
         else:
             tools = all_tools
 
@@ -100,12 +105,25 @@ class Orchestrator:
 
             # Execute each tool call
             tool_results: list[ToolResult] = []
+            stop_after_tool_result = False
+            final_tool_message: str | None = None
             for tc in response.tool_calls:
-                result_text, artifact_id = await self._execute_tool(session, tc, user_id=user_id)
+                result_text, artifact_id, should_stop = await self._execute_tool(session, tc, user_id=user_id)
                 tool_results.append(ToolResult(tool_call_id=tc.id, content=result_text))
                 if artifact_id:
                     new_artifact_ids.append(artifact_id)
                     session.artifact_ids.append(artifact_id)
+                if should_stop:
+                    stop_after_tool_result = True
+                    final_tool_message = result_text
+                    break
+
+            if stop_after_tool_result:
+                session.messages.append({
+                    "role": "assistant",
+                    "content": final_tool_message or "Execution has been deferred.",
+                })
+                break
 
             # Add tool results as a user message
             messages.append(Message(role="user", tool_results=tool_results))
@@ -134,21 +152,28 @@ class Orchestrator:
 
     async def _execute_tool(
         self, session: Session, tool_call: ToolCall, user_id: str | None = None,
-    ) -> tuple[str, str | None]:
+    ) -> tuple[str, str | None, bool]:
         if tool_call.name == "query_sql_source":
             return await self._execute_sql_query(session, tool_call.input, user_id=user_id)
         if tool_call.name == "transform_with_python":
             return await self._execute_python_transform(session, tool_call.input, user_id=user_id)
         if tool_call.name == "inspect_artifact":
             return await self._execute_inspect_artifact(session, tool_call.input)
-        return f"Unknown tool: {tool_call.name}", None
+        if tool_call.name == "check_job_status":
+            return await self._execute_check_job_status(session, tool_call.input)
+        return f"Unknown tool: {tool_call.name}", None, False
 
     async def _execute_sql_query(
         self, session: Session, tool_input: dict, user_id: str | None = None,
-    ) -> tuple[str, str | None]:
+    ) -> tuple[str, str | None, bool]:
         connection_name = tool_input.get("connection_name", "")
         query = tool_input.get("query", "")
         artifact_name = tool_input.get("artifact_name", "query_result")
+        estimated_row_count = tool_input.get("estimated_row_count")
+
+        parameters = {}
+        if estimated_row_count is not None:
+            parameters["estimated_row_count"] = estimated_row_count
 
         exec_request = ExecutionRequest(
             session_id=session.id,
@@ -160,6 +185,7 @@ class Orchestrator:
             ),
             target=ExecutionTarget(connection_name=connection_name),
             expected_outputs=[ExpectedOutput(name=artifact_name, type="table")],
+            parameters=parameters,
         )
 
         async with httpx.AsyncClient(timeout=120.0) as client:
@@ -170,25 +196,31 @@ class Orchestrator:
 
         if resp.status_code != 200:
             error_detail = resp.json().get("detail", resp.text)
-            return f"Error executing query: {error_detail}", None
+            return f"Error executing query: {error_detail}", None, False
 
         result = ExecutionResult(**resp.json())
         if result.status == "error":
-            return f"Query failed: {result.error_message}", None
+            return f"Query failed: {result.error_message}", None, False
         if result.status == "denied":
-            return f"Query denied by policy: {result.error_message}", None
+            return f"Query denied by policy: {result.error_message}", None, False
+        if result.status == "deferred":
+            return (
+                f"This query has been deferred to a background job (job ID: {result.job_id}). "
+                f"The query will run asynchronously. Use the check_job_status tool with "
+                f"job_id '{result.job_id}' to check when it's done."
+            ), None, True
 
         # Fetch artifact metadata for the summary
         artifact_id = result.artifact_ids[0] if result.artifact_ids else None
         if artifact_id:
             summary = await self._get_artifact_summary(artifact_id)
-            return summary, artifact_id
+            return summary, artifact_id, False
 
-        return "Query executed but no artifact was produced.", None
+        return "Query executed but no artifact was produced.", None, False
 
     async def _execute_python_transform(
         self, session: Session, tool_input: dict, user_id: str | None = None,
-    ) -> tuple[str, str | None]:
+    ) -> tuple[str, str | None, bool]:
         code = tool_input.get("code", "")
         input_artifact_names = tool_input.get("input_artifacts", [])
         artifact_name = tool_input.get("artifact_name", "transform_result")
@@ -200,7 +232,7 @@ class Orchestrator:
         for name in input_artifact_names:
             aid = artifact_map.get(name)
             if not aid:
-                return f"Artifact '{name}' not found in this session.", None
+                return f"Artifact '{name}' not found in this session.", None, False
             input_refs.append(ExecutionArtifactInput(artifact_id=aid, alias=name))
 
         exec_request = ExecutionRequest(
@@ -223,24 +255,30 @@ class Orchestrator:
 
         if resp.status_code != 200:
             error_detail = resp.json().get("detail", resp.text)
-            return f"Error executing transform: {error_detail}", None
+            return f"Error executing transform: {error_detail}", None, False
 
         result = ExecutionResult(**resp.json())
         if result.status == "error":
-            return f"Transform failed: {result.error_message}", None
+            return f"Transform failed: {result.error_message}", None, False
         if result.status == "denied":
-            return f"Transform denied by policy: {result.error_message}", None
+            return f"Transform denied by policy: {result.error_message}", None, False
+        if result.status == "deferred":
+            return (
+                f"This transform has been deferred to a background job (job ID: {result.job_id}). "
+                f"It will run asynchronously. Use the check_job_status tool with "
+                f"job_id '{result.job_id}' to check when it's done."
+            ), None, True
 
         artifact_id = result.artifact_ids[0] if result.artifact_ids else None
         if artifact_id:
             summary = await self._get_artifact_summary(artifact_id)
-            return summary, artifact_id
+            return summary, artifact_id, False
 
-        return "Transform executed but no artifact was produced.", None
+        return "Transform executed but no artifact was produced.", None, False
 
     async def _execute_inspect_artifact(
         self, session: Session, tool_input: dict
-    ) -> tuple[str, str | None]:
+    ) -> tuple[str, str | None, bool]:
         artifact_name = tool_input.get("artifact_name", "")
         max_rows = min(tool_input.get("max_rows", 5), 20)  # cap at 20
 
@@ -252,7 +290,7 @@ class Orchestrator:
                 artifact = a
                 break
         if not artifact:
-            return f"Artifact '{artifact_name}' not found in this session.", None
+            return f"Artifact '{artifact_name}' not found in this session.", None, False
 
         artifact_id = artifact["id"]
 
@@ -290,7 +328,54 @@ class Orchestrator:
             f"**Artifact: {artifact_name}** ({row_count} rows, {len(columns)} columns)\n\n"
             f"Columns:\n{col_details}\n\n"
             f"Sample rows (first {max_rows}):\n{sample_str}"
-        ), None
+        ), None, False
+
+    async def _execute_check_job_status(
+        self, session: Session, tool_input: dict
+    ) -> tuple[str, str | None, bool]:
+        job_id = tool_input.get("job_id", "")
+
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    f"{settings.execution_service_url}/jobs/{job_id}"
+                )
+            if resp.status_code == 404:
+                return f"Job '{job_id}' not found.", None, False
+            resp.raise_for_status()
+        except Exception as e:
+            return f"Error checking job status: {e}", None, False
+
+        job = resp.json()
+        status = job.get("status", "unknown")
+        logs = job.get("logs", [])
+        logs_str = "\n".join(f"  - {log}" for log in logs[-5:]) if logs else "  (no logs)"
+
+        if status == "completed":
+            result = job.get("result") or {}
+            artifact_ids = result.get("artifact_ids", [])
+            if artifact_ids:
+                artifact_id = artifact_ids[0]
+                summary = await self._get_artifact_summary(artifact_id)
+                session.artifact_ids.append(artifact_id)
+                self.sessions.save(session)
+                return (
+                    f"Job '{job_id}' has completed!\n\n{summary}\n\nLogs:\n{logs_str}"
+                ), artifact_id, False
+            return f"Job '{job_id}' completed but produced no artifacts.\n\nLogs:\n{logs_str}", None, False
+
+        if status == "failed":
+            error = job.get("error_message", "unknown error")
+            return f"Job '{job_id}' failed: {error}\n\nLogs:\n{logs_str}", None, False
+
+        if status == "running":
+            return (
+                f"Job '{job_id}' is still running. Check again shortly.\n\nLogs:\n{logs_str}"
+            ), None, False
+
+        return (
+            f"Job '{job_id}' status: {status}.\n\nLogs:\n{logs_str}"
+        ), None, False
 
     async def _get_artifact_summary(self, artifact_id: str) -> str:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -430,6 +515,8 @@ class Orchestrator:
             "- When the user wants to refine or filter a prior result, prefer transform_with_python over re-querying the source.",
             "- Be efficient: combine multiple calculations into a single query when possible rather than running separate queries for each metric.",
             "- Only use inspect_artifact when you genuinely need to see data values. You already get column names and row counts from query results.",
+            "- Large SQL queries and large Python transforms may be routed to background processing by the execution service.",
+            "- If a tool call is deferred (runs as a background job), tell the user and use check_job_status to check on it later.",
         ])
 
         # Active skills

@@ -36,6 +36,11 @@ class PolicyCondition(BaseModel):
     source_types: list[str] = []
     sensitivity_levels: list[str] = []
 
+    # Query analysis conditions (matched against SQL runtime /analyze output)
+    max_source_table_rows_above: int | None = None
+    query_has_no_where: bool | None = None
+    query_has_no_limit: bool | None = None
+
     # Task/tool conditions
     task_types: list[str] = []
     tool_names: list[str] = []

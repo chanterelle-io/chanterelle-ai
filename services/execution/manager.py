@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import json
@@ -13,9 +14,9 @@ from sqlalchemy import text
 
 from shared.contracts.artifact import (
     ArtifactLineage,
+    ArtifactRecord,
     ArtifactStatistics,
     CreateArtifactRequest,
-    ArtifactRecord,
     SchemaColumn,
     TableSchema,
 )
@@ -40,6 +41,7 @@ from shared.contracts.topic import (
     UserTopicAssignment,
     ResolvedTopicContext,
 )
+from shared.contracts.job import JobRecord, JobStatus
 from shared.db import get_engine
 from shared.settings import settings
 
@@ -143,16 +145,17 @@ class ExecutionManager:
         matched: list[PolicyRecord] = []
 
         for policy in all_policies:
+            # If policy has topic_profile_ids in scope, only match when those profiles are active
+            if policy.scope.topic_profile_ids:
+                if not topic_profile_ids or not (set(policy.scope.topic_profile_ids) & set(topic_profile_ids)):
+                    continue
+                matched.append(policy)
+                continue
+
             # Global scope always matches
             if policy.scope.level == "global":
                 matched.append(policy)
                 continue
-
-            # Topic-scoped: match if policy is bound to one of the active topic profiles
-            if policy.scope.topic_profile_ids and topic_profile_ids:
-                if set(policy.scope.topic_profile_ids) & set(topic_profile_ids):
-                    matched.append(policy)
-                    continue
 
             # Connection-scoped: match if source type is in condition
             if connection_type and policy.condition.source_types:
@@ -174,6 +177,7 @@ class ExecutionManager:
         connection_type: str | None = None,
         topic_profile_ids: list[str] | None = None,
         estimated_row_count: int | None = None,
+        query_analysis: dict | None = None,
     ) -> PolicyEvaluation:
         """Evaluate all matching policies and merge their effects."""
         policies = self.get_policies_for_context(
@@ -186,13 +190,7 @@ class ExecutionManager:
         evaluation.matched_policies = policies
 
         for policy in policies:
-            # Check row count threshold condition
-            if (
-                policy.condition.estimated_row_count_above is not None
-                and estimated_row_count is not None
-                and estimated_row_count <= policy.condition.estimated_row_count_above
-            ):
-                # Condition not met — skip this policy's effects
+            if not self._check_policy_conditions(policy, estimated_row_count, query_analysis):
                 continue
 
             effect = policy.effect
@@ -218,6 +216,38 @@ class ExecutionManager:
         evaluation.denied_runtimes = list(set(evaluation.denied_runtimes))
 
         return evaluation
+
+    def _check_policy_conditions(
+        self,
+        policy: PolicyRecord,
+        estimated_row_count: int | None,
+        query_analysis: dict | None,
+    ) -> bool:
+        """Return True if all conditions on a policy are met."""
+        cond = policy.condition
+
+        # Legacy: estimated_row_count_above (from request parameters)
+        if cond.estimated_row_count_above is not None:
+            if estimated_row_count is None or estimated_row_count <= cond.estimated_row_count_above:
+                return False
+
+        # Query analysis conditions
+        if cond.max_source_table_rows_above is not None:
+            max_rows = query_analysis.get("max_source_table_rows") if query_analysis else None
+            if max_rows is None or max_rows <= cond.max_source_table_rows_above:
+                return False
+
+        if cond.query_has_no_where is True:
+            has_where = query_analysis.get("has_where_clause", True) if query_analysis else True
+            if has_where:
+                return False
+
+        if cond.query_has_no_limit is True:
+            has_limit = query_analysis.get("has_limit_clause", False) if query_analysis else False
+            if has_limit:
+                return False
+
+        return True
 
     # --- Topic Profile registry ---
 
@@ -297,6 +327,134 @@ class ExecutionManager:
             active_policy_ids=sorted(policy_ids),
         )
 
+    # --- Job manager ---
+
+    def create_job(self, req: ExecutionRequest) -> JobRecord:
+        engine = get_engine()
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("""
+                    INSERT INTO jobs (session_id, user_id, status, execution_request)
+                    VALUES (:session_id, :user_id, 'submitted', :execution_request)
+                    RETURNING id, session_id, user_id, status, execution_request, result,
+                              logs, error_message, created_at, updated_at, completed_at
+                """),
+                {
+                    "session_id": req.session_id,
+                    "user_id": req.user_id,
+                    "execution_request": json.dumps(req.model_dump()),
+                },
+            ).mappings().fetchone()
+            conn.commit()
+        return self._row_to_job(row)
+
+    def get_job(self, job_id: str) -> JobRecord | None:
+        engine = get_engine()
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT * FROM jobs WHERE id = :id"),
+                {"id": job_id},
+            ).mappings().fetchone()
+        return self._row_to_job(row) if row else None
+
+    def list_jobs_for_session(self, session_id: str) -> list[JobRecord]:
+        engine = get_engine()
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT * FROM jobs WHERE session_id = :session_id ORDER BY created_at DESC"),
+                {"session_id": session_id},
+            ).mappings().fetchall()
+        return [self._row_to_job(r) for r in rows]
+
+    def update_job_status(
+        self,
+        job_id: str,
+        status: JobStatus,
+        result: dict | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        engine = get_engine()
+        with engine.connect() as conn:
+            if status in (JobStatus.COMPLETED, JobStatus.FAILED):
+                conn.execute(
+                    text("""
+                        UPDATE jobs
+                        SET status = :status, result = :result, error_message = :error_message,
+                            updated_at = NOW(), completed_at = NOW()
+                        WHERE id = :id
+                    """),
+                    {
+                        "id": job_id,
+                        "status": status.value,
+                        "result": json.dumps(result) if result else None,
+                        "error_message": error_message,
+                    },
+                )
+            else:
+                conn.execute(
+                    text("UPDATE jobs SET status = :status, updated_at = NOW() WHERE id = :id"),
+                    {"id": job_id, "status": status.value},
+                )
+            conn.commit()
+
+    def append_job_log(self, job_id: str, message: str) -> None:
+        engine = get_engine()
+        with engine.connect() as conn:
+            conn.execute(
+                text("""
+                    UPDATE jobs
+                    SET logs = logs || CAST(:entry AS jsonb), updated_at = NOW()
+                    WHERE id = :id
+                """),
+                {"id": job_id, "entry": json.dumps([message])},
+            )
+            conn.commit()
+
+    async def run_deferred_execution(self, job: JobRecord) -> None:
+        """Run an execution request in the background. Updates the job record on completion."""
+        job_id = job.id
+        try:
+            self.update_job_status(job_id, JobStatus.RUNNING)
+            self.append_job_log(job_id, "Execution started")
+
+            # Reconstruct the execution request
+            req = ExecutionRequest(**job.execution_request)
+            tool_name = req.tool.tool_name
+            runtime_type = TOOL_RUNTIME_MAP.get(tool_name)
+
+            if runtime_type == "sql":
+                result = await self._execute_sql(req)
+            elif runtime_type == "python":
+                result = await self._execute_python(req)
+            else:
+                result = ExecutionResult(
+                    execution_id=req.id,
+                    status="error",
+                    error_message=f"No runtime mapped for tool: {tool_name}",
+                )
+
+            if result.status == "success":
+                self.update_job_status(
+                    job_id, JobStatus.COMPLETED,
+                    result=result.model_dump(),
+                )
+                self.append_job_log(job_id, f"Completed with artifacts: {result.artifact_ids}")
+            else:
+                self.update_job_status(
+                    job_id, JobStatus.FAILED,
+                    result=result.model_dump(),
+                    error_message=result.error_message,
+                )
+                self.append_job_log(job_id, f"Failed: {result.error_message}")
+
+        except Exception as e:
+            logger.error("Deferred execution failed for job %s: %s", job_id, e)
+            self.update_job_status(
+                job_id, JobStatus.FAILED,
+                error_message=str(e),
+            )
+            self.append_job_log(job_id, f"Unexpected error: {e}")
+
     # --- Runtime registry ---
 
     def list_runtimes(self) -> list[RuntimeRecord]:
@@ -334,11 +492,24 @@ class ExecutionManager:
         if connection:
             connection_type = connection.type
 
-        # Evaluate policies
+        # Analyze query for policy evaluation (lightweight — no query execution)
+        query_analysis = await self._get_query_analysis(
+            req=req,
+            runtime_type=runtime_type,
+            connection=connection,
+        )
+
+        # Derive estimated row count from analysis for backward-compatible conditions
+        estimated_row_count = req.parameters.get("estimated_row_count")
+        if query_analysis and query_analysis.get("max_source_table_rows") is not None:
+            estimated_row_count = query_analysis["max_source_table_rows"]
+
         evaluation = self.evaluate_policies(
             tool_name=tool_name,
             connection_type=connection_type,
             topic_profile_ids=topic_profile_ids,
+            estimated_row_count=estimated_row_count,
+            query_analysis=query_analysis,
         )
 
         if evaluation.matched_policies:
@@ -375,6 +546,19 @@ class ExecutionManager:
                 policy_evaluation=evaluation.model_dump(),
             )
 
+        # Check if policy forces deferred execution
+        if evaluation.force_execution_mode == "deferred":
+            job = self.create_job(req)
+            self.append_job_log(job.id, f"Deferred by policy: {[p.name for p in evaluation.matched_policies]}")
+            # Launch background execution
+            asyncio.create_task(self.run_deferred_execution(job))
+            return ExecutionResult(
+                execution_id=req.id,
+                status="deferred",
+                job_id=job.id,
+                policy_evaluation=evaluation.model_dump(),
+            )
+
         if runtime_type == "sql":
             return await self._execute_sql(req, connection=connection)
         elif runtime_type == "python":
@@ -385,6 +569,34 @@ class ExecutionManager:
                 status="error",
                 error_message=f"No runtime mapped for tool: {tool_name}",
             )
+
+    async def _get_query_analysis(
+        self,
+        req: ExecutionRequest,
+        runtime_type: str | None,
+        connection: ConnectionRecord | None,
+    ) -> dict | None:
+        """Get lightweight query analysis from the SQL runtime without executing the query."""
+        if runtime_type == "sql" and connection is not None:
+            query = req.tool.payload.get("query", "")
+            if not query.strip():
+                return None
+            try:
+                return await self._analyze_sql_query(connection, query)
+            except Exception as e:
+                logger.warning("SQL query analysis failed: %s", e)
+                return None
+
+        if runtime_type == "python" and req.input_artifacts:
+            # For Python transforms, build a synthetic analysis from input artifacts
+            try:
+                row_counts = await self._get_input_artifact_row_counts(req.input_artifacts)
+                if row_counts:
+                    return {"max_source_table_rows": sum(row_counts)}
+            except Exception as e:
+                logger.warning("Python input analysis failed: %s", e)
+
+        return None
 
     async def _execute_sql(self, req: ExecutionRequest, connection: ConnectionRecord | None = None) -> ExecutionResult:
         # 1. Resolve connection (use pre-resolved if available)
@@ -575,6 +787,29 @@ class ExecutionManager:
         columns = resp.headers.get("X-Columns", "").split(",")
         return resp.content, row_count, columns
 
+    async def _analyze_sql_query(self, connection: ConnectionRecord, query: str) -> dict:
+        """Call the SQL runtime /analyze endpoint for lightweight query metadata."""
+        runtime = self.get_runtime_by_type("sql")
+        runtime_url = runtime.endpoint_url if runtime else settings.sql_runtime_url
+
+        conn_config = connection.config.model_dump()
+        resolved_auth = self._resolve_credentials(connection)
+        if resolved_auth:
+            conn_config.update(resolved_auth)
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                f"{runtime_url}/analyze",
+                json={
+                    "connection_type": connection.type,
+                    "connection_config": conn_config,
+                    "query": query,
+                },
+            )
+            resp.raise_for_status()
+
+        return resp.json()
+
     def _resolve_credentials(self, connection: ConnectionRecord) -> dict | None:
         """Resolve credential references into actual values.
 
@@ -603,6 +838,24 @@ class ExecutionManager:
             )
             resp.raise_for_status()
         return resp.content
+
+    async def _get_input_artifact_row_counts(
+        self, input_artifacts: list[ExecutionArtifactInput]
+    ) -> list[int]:
+        row_counts: list[int] = []
+        for inp in input_artifacts:
+            artifact = await self._fetch_artifact(inp.artifact_id)
+            if artifact and artifact.statistics and artifact.statistics.row_count is not None:
+                row_counts.append(artifact.statistics.row_count)
+        return row_counts
+
+    async def _fetch_artifact(self, artifact_id: str) -> ArtifactRecord | None:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(f"{settings.artifact_service_url}/artifacts/{artifact_id}")
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return ArtifactRecord(**resp.json())
 
     def _extract_schema(self, parquet_bytes: bytes) -> TableSchema:
         buf = io.BytesIO(parquet_bytes)
@@ -775,4 +1028,30 @@ class ExecutionManager:
             tags=_parse_json_list(row.get("tags")),
             created_at=row.get("created_at"),
             updated_at=row.get("updated_at"),
+        )
+
+    def _row_to_job(self, row) -> JobRecord:
+        exec_req_raw = row.get("execution_request") or "{}"
+        exec_req = json.loads(exec_req_raw) if isinstance(exec_req_raw, str) else exec_req_raw
+
+        result_raw = row.get("result")
+        result = None
+        if result_raw:
+            result = json.loads(result_raw) if isinstance(result_raw, str) else result_raw
+
+        logs_raw = row.get("logs") or "[]"
+        logs = json.loads(logs_raw) if isinstance(logs_raw, str) else logs_raw
+
+        return JobRecord(
+            id=str(row["id"]),
+            session_id=row["session_id"],
+            user_id=row.get("user_id"),
+            status=row["status"],
+            execution_request=exec_req,
+            result=result,
+            logs=logs,
+            error_message=row.get("error_message"),
+            created_at=row.get("created_at"),
+            updated_at=row.get("updated_at"),
+            completed_at=row.get("completed_at"),
         )

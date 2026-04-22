@@ -25,6 +25,13 @@ SQL_QUERY_TOOL = ToolDefinition(
                     "(e.g. 'customers_last_month', 'revenue_by_product')."
                 ),
             },
+            "estimated_row_count": {
+                "type": "integer",
+                "description": (
+                    "Optional estimate of how many rows this query will return. "
+                    "The execution service may still route large queries to background processing."
+                ),
+            },
         },
         "required": ["connection_name", "query", "artifact_name"],
     },

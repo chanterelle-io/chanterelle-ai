@@ -4,7 +4,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fastapi.responses import Response
 
-from services.sql_runtime.executor import execute_sql
+from services.sql_runtime.executor import analyze_query, execute_sql
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -39,3 +39,20 @@ def run_query(req: SqlExecuteRequest) -> Response:
             "X-Columns": ",".join(columns),
         },
     )
+
+
+@app.post("/analyze")
+def analyze(req: SqlExecuteRequest) -> dict:
+    """Analyze a SQL query without executing it. Returns table metadata and query patterns."""
+    logger.info("Analyzing SQL on %s connection", req.connection_type)
+    try:
+        analysis = analyze_query(
+            connection_type=req.connection_type,
+            connection_config=req.connection_config,
+            query=req.query,
+        )
+    except Exception as e:
+        logger.error("SQL analysis failed: %s", e)
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return analysis

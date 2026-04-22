@@ -40,3 +40,4 @@ from shared.contracts.topic import (
     UserTopicAssignment,
     ResolvedTopicContext,
 )
+from shared.contracts.job import JobRecord, JobStatus

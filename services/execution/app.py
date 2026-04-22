@@ -8,6 +8,7 @@ from shared.contracts.runtime import RuntimeRecord
 from shared.contracts.skill import SkillRecord
 from shared.contracts.policy import PolicyRecord, PolicyEvaluation
 from shared.contracts.topic import TopicProfile, UserTopicAssignment, ResolvedTopicContext
+from shared.contracts.job import JobRecord
 from services.execution.manager import ExecutionManager
 
 logging.basicConfig(level=logging.INFO)
@@ -78,3 +79,19 @@ def list_topic_profiles() -> list[TopicProfile]:
 @app.get("/topics/resolve", response_model=ResolvedTopicContext)
 def resolve_topic_context(user_id: str) -> ResolvedTopicContext:
     return manager.resolve_topic_context(user_id)
+
+
+@app.get("/jobs", response_model=list[JobRecord])
+def list_jobs(session_id: str | None = None) -> list[JobRecord]:
+    if session_id:
+        return manager.list_jobs_for_session(session_id)
+    return []
+
+
+@app.get("/jobs/{job_id}", response_model=JobRecord)
+def get_job(job_id: str) -> JobRecord:
+    job = manager.get_job(job_id)
+    if not job:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job

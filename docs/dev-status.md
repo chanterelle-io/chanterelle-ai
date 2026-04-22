@@ -56,7 +56,8 @@ Status: **Complete — tested end-to-end**
 #### Seed Data
 - [x] `scripts/seed.py` — creates `data/sample.db` (customers, orders, products) + registers `sample_db` connection + registers runtimes + seeds skills
 
-### Not Built Yet (Phase 5+)iction
+### Not Built Yet (Phase 6+)
+- [ ] Retention + eviction
 - [ ] Workflow definitions
 
 ### Known Limitations
@@ -101,91 +102,93 @@ Status: **Complete — tested end-to-end**
 
 ## Phase 4 — Policies + Topic Profiles + Execution Routing ✓
 Status: **Complete — tested end-to-end**
-Phase 4 — Policies + Topic Profiles + Execution Routing ✓
+
+### What's Built
+
+#### DB Schema
+- [x] `policies` table in `db/init.sql` (id, name, type, status, description, scope, condition, effect, priority, tags)
+- [x] `topic_profiles` table (id, name, display_name, description, allowed_tool_names, allowed_connection_names, allowed_runtime_types, active_skill_ids, active_policy_ids, domains, tags)
+- [x] `user_topic_assignments` table (id, user_id, topic_profile_id, status, granted_at, granted_by)
+- [x] `scripts/migrate_phase4.py` — migration for existing DBs
+
+#### Shared Contracts
+- [x] `shared/contracts/policy.py` — PolicyRecord, PolicyType, PolicyStatus, PolicyScope, PolicyCondition, PolicyEffect, PolicyEvaluation
+- [x] `shared/contracts/topic.py` — TopicProfile, UserTopicAssignment, ResolvedTopicContext
+- [x] `shared/contracts/execution.py` — added `user_id` to ExecutionRequest, `policy_evaluation` + `denied` status to ExecutionResult
+
+#### 4.1 Policy Registry (Execution Service)
+- [x] `manager.py` — `list_policies()`, `get_policies_for_context()`, `evaluate_policies()`
+- [x] Policy matching by scope (global, topic-profile-linked), condition (tool_names, source_types, row count thresholds)
+- [x] Merged effects: denied tools, denied runtimes, forced execution mode, approval gates
+- [x] `app.py` — `GET /policies`, `GET /policies/evaluate`
+
+#### 4.2 Execution Policy Evaluation
+- [x] `execute()` evaluates policies before calling runtimes
+- [x] Returns `status: "denied"` with policy details when blocked
+- [x] Checks denied tools, denied runtimes, and approval requirements
+
+#### 4.3 Topic Profile Registry (Execution Service)
+- [x] `manager.py` — `list_topic_profiles()`, `get_user_topic_assignments()`, `resolve_topic_context()`
+- [x] Merges all active profiles for a user into `ResolvedTopicContext`
+- [x] `app.py` — `GET /topics`, `GET /topics/resolve?user_id=`
+
+#### 4.4 Topic Resolution in Agent
+- [x] `/chat` accepts optional `user_id` (backward compatible — no user_id = full access)
+- [x] `orchestrator.py` — fetches topic context, filters connections, tools, and skills by profile
+- [x] System prompt includes active topic profile names and constraints
+- [x] `user_id` passed through to ExecutionRequest for server-side policy enforcement
+- [x] Denied execution results handled gracefully in tool responses
+
+#### Seed Data
+- [x] 2 policies: `deny_python_for_finance` (tool_selection), `large_query_advisory` (execution_routing)
+- [x] 2 topic profiles: `finance_analysis` (SQL + inspect only), `general_exploration` (full access)
+- [x] 2 user assignments: `finance-user` → finance_analysis, `analyst-user` → general_exploration
+
+## Phase 5 — Deferred Execution + Job Manager ✓
 Status: **Complete — tested end-to-end**
 
 ### What's Built
 
 #### DB Schema
-- [x] `policies` table in `db/init.sql` (id, name, type, status, description, scope, condition, effect, priority, tags)
-- [x] `topic_profiles` table (id, name, display_name, description, allowed_tool_names, allowed_connection_names, allowed_runtime_types, active_skill_ids, active_policy_ids, domains, tags)
-- [x] `user_topic_assignments` table (id, user_id, topic_profile_id, status, granted_at, granted_by)
-- [x] `scripts/migrate_phase4.py` — migration for existing DBs
+- [x] `jobs` table in `db/init.sql` (id, session_id, user_id, status, execution_request, result, logs, error_message, created_at, updated_at, completed_at)
+- [x] Indexes on `session_id` and `status`
+- [x] `scripts/migrate_phase5.py` — migration for existing DBs
+- [x] `Makefile` target: `make migrate-phase5`
 
 #### Shared Contracts
-- [x] `shared/contracts/policy.py` — PolicyRecord, PolicyType, PolicyStatus, PolicyScope, PolicyCondition, PolicyEffect, PolicyEvaluation
-- [x] `shared/contracts/topic.py` — TopicProfile, UserTopicAssignment, ResolvedTopicContext
-- [x] `shared/contracts/execution.py` — added `user_id` to ExecutionRequest, `policy_evaluation` + `denied` status to ExecutionResult
+- [x] `shared/contracts/job.py` — JobRecord, JobStatus (submitted, running, completed, failed)
+- [x] `shared/contracts/execution.py` — added `job_id` to ExecutionResult, `"deferred"` status
+- [x] `shared/contracts/policy.py` — extended PolicyCondition with `max_source_table_rows_above`, `query_has_no_where`, `query_has_no_limit`
 
-#### 4.1 Policy Registry (Execution Service)
-- [x] `manager.py` — `list_policies()`, `get_policies_for_context()`, `evaluate_policies()`
-- [x] Policy matching by scope (global, topic-profile-linked), condition (tool_names, source_types, row count thresholds)
-- [x] Merged effects: denied tools, denied runtimes, forced execution mode, approval gates
-- [x] `app.py` — `GET /policies`, `GET /policies/evaluate`
+#### 5.1 Job Manager (Execution Service)
+- [x] `manager.py` — `create_job()`, `get_job()`, `list_jobs_for_session()`, `update_job_status()`, `append_job_log()`
+- [x] `run_deferred_execution()` — async background execution via `asyncio.create_task()`
+- [x] `app.py` — `GET /jobs/{job_id}`, `GET /jobs?session_id=`
 
-#### 4.2 Execution Policy Evaluation
-- [x] `execute()` evaluates policies before calling runtimes
-- [x] Returns `status: "denied"` with policy details when blocked
-- [x] Checks denied tools, denied runtimes, and approval requirements
+#### 5.2 Lightweight Query Analysis (SQL Runtime)
+- [x] `executor.py` — `analyze_query()`: extracts table names via regex, looks up per-table row counts, detects WHERE/LIMIT clauses
+- [x] SQLite: `SELECT COUNT(*) FROM table` per source table (fast — no subquery of the user's query)
+- [x] PostgreSQL: uses `pg_stat_user_tables.n_live_tup` (free, no table scan)
+- [x] `app.py` — `POST /analyze` endpoint returns `{source_tables, table_row_counts, max_source_table_rows, has_where_clause, has_limit_clause}`
 
-#### 4.3 Topic Profile Registry (Execution Service)
-- [x] `manager.py` — `list_topic_profiles()`, `get_user_topic_assignments()`, `resolve_topic_context()`
-- [x] Merges all active profiles for a user into `ResolvedTopicContext`
-- [x] `app.py` — `GET /topics`, `GET /topics/resolve?user_id=`
+#### 5.3 Server-Side Policy Evaluation with Query Analysis
+- [x] `manager.py` — `_get_query_analysis()` calls SQL runtime `/analyze` for SQL, builds synthetic analysis from input artifact row counts for Python
+- [x] `_check_policy_conditions()` evaluates all condition types (AND'd): `estimated_row_count_above`, `max_source_table_rows_above`, `query_has_no_where`, `query_has_no_limit`
+- [x] `execute()` integrates query analysis into policy evaluation — fully server-side, no agent involvement
 
-#### 4.4 Topic Resolution in Agent
-- [x] `/chat` accepts optional `user_id` (backward compatible — no user_id = full access)
-- [x] `orchestrator.py` — fetches topic context, filters connections, tools, and skills by profile
-- [x] System prompt includes active topic profile names and constraints
-- [x] `user_id` passed through to ExecutionRequest for server-side policy enforcement
-- [x] Denied execution results handled gracefully in tool responses
-
-#### Seed Data
-- [x] 2 policies: `deny_python_for_finance` (tool_selection), `large_query_advisory` (execution_routing)
-- [x] 2 topic profiles: `finance_analysis` (SQL + inspect only), `general_exploration` (full access)
-- [x] 2 user assignments: `finance-user` → finance_analysis, `analyst-user` → general_exploration
-
-## 
-### What's Built
-
-#### DB Schema
-- [x] `policies` table in `db/init.sql` (id, name, type, status, description, scope, condition, effect, priority, tags)
-- [x] `topic_profiles` table (id, name, display_name, description, allowed_tool_names, allowed_connection_names, allowed_runtime_types, active_skill_ids, active_policy_ids, domains, tags)
-- [x] `user_topic_assignments` table (id, user_id, topic_profile_id, status, granted_at, granted_by)
-- [x] `scripts/migrate_phase4.py` — migration for existing DBs
-
-#### Shared Contracts
-- [x] `shared/contracts/policy.py` — PolicyRecord, PolicyType, PolicyStatus, PolicyScope, PolicyCondition, PolicyEffect, PolicyEvaluation
-- [x] `shared/contracts/topic.py` — TopicProfile, UserTopicAssignment, ResolvedTopicContext
-- [x] `shared/contracts/execution.py` — added `user_id` to ExecutionRequest, `policy_evaluation` + `denied` status to ExecutionResult
-
-#### 4.1 Policy Registry (Execution Service)
-- [x] `manager.py` — `list_policies()`, `get_policies_for_context()`, `evaluate_policies()`
-- [x] Policy matching by scope (global, topic-profile-linked), condition (tool_names, source_types, row count thresholds)
-- [x] Merged effects: denied tools, denied runtimes, forced execution mode, approval gates
-- [x] `app.py` — `GET /policies`, `GET /policies/evaluate`
-
-#### 4.2 Execution Policy Evaluation
-- [x] `execute()` evaluates policies before calling runtimes
-- [x] Returns `status: "denied"` with policy details when blocked
-- [x] Checks denied tools, denied runtimes, and approval requirements
-
-#### 4.3 Topic Profile Registry (Execution Service)
-- [x] `manager.py` — `list_topic_profiles()`, `get_user_topic_assignments()`, `resolve_topic_context()`
-- [x] Merges all active profiles for a user into `ResolvedTopicContext`
-- [x] `app.py` — `GET /topics`, `GET /topics/resolve?user_id=`
-
-#### 4.4 Topic Resolution in Agent
-- [x] `/chat` accepts optional `user_id` (backward compatible — no user_id = full access)
-- [x] `orchestrator.py` — fetches topic context, filters connections, tools, and skills by profile
-- [x] System prompt includes active topic profile names and constraints
-- [x] `user_id` passed through to ExecutionRequest for server-side policy enforcement
-- [x] Denied execution results handled gracefully in tool responses
+#### 5.4 Agent Integration
+- [x] `orchestrator.py` — agent loop breaks immediately on `"deferred"` status (doesn't auto-poll)
+- [x] `check_job_status` tool available to check deferred job status in follow-up turns
+- [x] System prompt informs LLM that large queries may be routed to background processing
+- [x] `estimated_row_count` optional in tool schema (backward-compat fallback only)
 
 #### Seed Data
-- [x] 2 policies: `deny_python_for_finance` (tool_selection), `large_query_advisory` (execution_routing)
-- [x] 2 topic profiles: `finance_analysis` (SQL + inspect only), `general_exploration` (full access)
-- [x] 2 user assignments: `finance-user` → finance_analysis, `analyst-user` → general_exploration
+- [x] `large_query_advisory` policy updated: condition = `{max_source_table_rows_above: 100, query_has_no_limit: true}`, effect = `force_execution_mode: "deferred"`
+
+### Design Notes
+- Policies are fully server-side — the agent cannot influence or bypass policy decisions
+- Query analysis is lightweight: table metadata lookups + pattern detection, never re-executes the user's query
+- The `parameters` dict on ExecutionRequest provides an extension point for structured agent hints, but server-side analysis is the primary signal
 
 ## Sample Data Source
 - SQLite at `data/sample.db`
