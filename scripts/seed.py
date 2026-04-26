@@ -382,7 +382,12 @@ def seed_topic_profiles() -> None:
             "name": "finance_analysis",
             "display_name": "Finance Analysis",
             "description": "Scoped to financial queries on the sample DB. SQL only, no Python transforms.",
-            "allowed_tool_names": json.dumps(["query_sql_source", "inspect_artifact"]),
+            "allowed_tool_names": json.dumps([
+                "query_sql_source",
+                "inspect_artifact",
+                "pin_artifact",
+                "unpin_artifact",
+            ]),
             "allowed_connection_names": json.dumps(["sample_db"]),
             "allowed_runtime_types": json.dumps(["sql"]),
             "active_skill_ids": json.dumps([connector_skill_id] if connector_skill_id else []),
@@ -394,7 +399,13 @@ def seed_topic_profiles() -> None:
             "name": "general_exploration",
             "display_name": "General Exploration",
             "description": "Full access to all tools and connections for exploratory analysis.",
-            "allowed_tool_names": json.dumps(["query_sql_source", "transform_with_python", "inspect_artifact"]),
+            "allowed_tool_names": json.dumps([
+                "query_sql_source",
+                "transform_with_python",
+                "inspect_artifact",
+                "pin_artifact",
+                "unpin_artifact",
+            ]),
             "allowed_connection_names": json.dumps(["sample_db"]),
             "allowed_runtime_types": json.dumps(["sql", "python"]),
             "active_skill_ids": json.dumps(

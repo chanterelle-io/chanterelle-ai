@@ -263,6 +263,46 @@ User requests a wide date-range analysis. Policy routes to deferred. Job is crea
 - Automatic eviction following the priority order
 - User pinning/unpinning via agent commands
 
+Recommended implementation order:
+1. Retention metadata and defaults
+2. Pin/unpin flows
+3. Quota accounting and eviction candidate selection
+4. Automatic eviction
+
+#### 6.1.1 Retention model foundation
+
+- Extend artifact metadata with retention fields such as retention class, pinned state, expires-at, and last-accessed-at
+- Apply retention defaults when artifacts are created based on artifact type, producing tool, or workflow context
+- Update access timestamps on artifact reads so eviction decisions can use recent usage rather than creation time alone
+- Expose retention metadata in artifact catalog responses so the agent and future UI can explain lifecycle state
+
+#### 6.1.2 Pin/unpin flows
+
+- Add artifact-service operations to pin and unpin an artifact explicitly
+- Support user-facing agent commands such as "pin this artifact" and "unpin that table from earlier"
+- Treat pinning as an override on top of the retention class rather than a separate storage path
+- Surface pin state in artifact metadata and agent responses so users can see what is protected from cleanup
+
+#### 6.1.3 Quota tracking and eviction planning
+
+- Track storage usage at the workspace level and expose current usage versus quota
+- Define eviction priority using retention class, expiration state, pin state, and recency of access
+- Add a way to list eviction candidates before deletion so behavior can be validated safely
+- Keep catalog state and object-store deletion in sync when an artifact is evicted
+
+#### 6.1.4 Automatic eviction
+
+- Run cleanup on a scheduled or on-write basis when quota or retention thresholds are exceeded
+- Skip pinned and persistent artifacts unless an explicit administrative policy says otherwise
+- Record eviction reason and timestamps for debugging and user-facing explanations
+
+### Phase 6.1 test
+
+1. User creates multiple temporary and reusable artifacts until the workspace exceeds quota.
+2. User pins one artifact that would otherwise be eligible for cleanup.
+3. Eviction removes the correct unpinned artifacts in priority order while preserving the pinned artifact.
+4. User unpins the protected artifact, and it becomes eligible under the normal retention rules on the next cleanup pass.
+
 ### 6.2 Artifact previews
 
 - Generate sample row previews when artifacts are created

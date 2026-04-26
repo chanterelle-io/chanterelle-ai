@@ -24,6 +24,9 @@ CREATE TABLE IF NOT EXISTS artifacts (
     statistics JSONB,
     lineage JSONB,
     retention_class VARCHAR(50) NOT NULL DEFAULT 'temporary',
+    is_pinned BOOLEAN NOT NULL DEFAULT FALSE,
+    expires_at TIMESTAMPTZ,
+    last_accessed_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ,
     extra_metadata JSONB
@@ -31,16 +34,22 @@ CREATE TABLE IF NOT EXISTS artifacts (
 
 CREATE INDEX IF NOT EXISTS idx_artifacts_session ON artifacts(session_id);
 CREATE INDEX IF NOT EXISTS idx_artifacts_name ON artifacts(session_id, name);
+CREATE INDEX IF NOT EXISTS idx_artifacts_expires_at ON artifacts(expires_at);
+CREATE INDEX IF NOT EXISTS idx_artifacts_last_accessed_at ON artifacts(last_accessed_at);
 
 -- Phase 2: Sessions
 CREATE TABLE IF NOT EXISTS sessions (
     id VARCHAR(255) PRIMARY KEY,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_accessed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ,
     updated_at TIMESTAMPTZ,
     messages JSONB NOT NULL DEFAULT '[]',
     artifact_ids JSONB NOT NULL DEFAULT '[]',
     metadata JSONB NOT NULL DEFAULT '{}'
 );
+
+CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
 
 -- Phase 2: Runtime Registry
 CREATE TABLE IF NOT EXISTS runtimes (

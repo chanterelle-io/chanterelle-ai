@@ -52,9 +52,9 @@ On each turn:
 1. Loads the session (or creates a new one)
 2. If a `user_id` is provided, resolves the user's **topic profiles** — which tools, connections, and skills they're allowed to use
 3. Filters connections and fetches applicable skills (scoped by topic profile if active)
-4. Builds a system prompt with connections, artifacts, skill instructions, and topic constraints
+4. Builds a system prompt with connections, artifacts, the active tool list for that turn, skill instructions, and topic constraints
 5. Sends the conversation to the LLM (only the tools allowed by the topic profile)
-6. If the LLM calls a tool (e.g. `query_sql_source`, `transform_with_python`, or `inspect_artifact`), the agent executes it by calling the Execution Service or Artifact Service
+6. If the LLM calls a tool (e.g. `query_sql_source`, `transform_with_python`, `inspect_artifact`, `pin_artifact`, or `unpin_artifact`), the agent executes it by calling the Execution Service or Artifact Service
 7. Feeds the tool result back to the LLM (including policy denial or deferred messages)
 8. If the execution was deferred, the agent stops the tool loop and reports the job ID to the user
 9. Returns the LLM's final response to the user
@@ -66,6 +66,8 @@ The LLM provider is abstracted — currently Claude, swappable to any provider b
 - `query_sql_source` — execute SQL against a connected data source
 - `transform_with_python` — run Python code on existing artifacts (loaded as pandas DataFrames)
 - `inspect_artifact` — read sample rows and column details from an existing artifact without re-querying
+- `pin_artifact` — protect an existing artifact from automatic cleanup
+- `unpin_artifact` — remove that cleanup protection and return the artifact to normal retention handling
 - `check_job_status` — check the status of a deferred background job
 
 ### Execution Service (port 8001)
@@ -89,15 +91,17 @@ Before executing, it evaluates **policies** against the request context (tool, c
 
 The data librarian. Owns two things:
 
-- **Catalog** (Postgres) — metadata about every artifact: name, schema (columns + types), row count, byte size, lineage (which connection, what query produced it), retention class
+- **Catalog** (Postgres) — metadata about every artifact: name, schema (columns + types), row count, byte size, lineage (which connection, what query produced it), retention class, pin state, expiration, last access time, and eviction details
 - **Store** (MinIO/S3) — the actual Parquet files
 
 When a query produces a table:
 1. A catalog record is created with all metadata
 2. The Parquet file is uploaded to object storage
-3. The artifact is now available for future steps — the agent can inspect its schema, a Python runtime can load it, or the user can download it
+3. A cached preview of the first few rows is generated and stored with the artifact metadata
+4. The upload path checks session quota and cleanup rules. Expired or lower-priority unpinned artifacts may be evicted if needed, while pinned artifacts are preserved
+5. The artifact is now available for future steps — the agent can inspect its schema, reuse the cached preview, show preview rows in normal result summaries, a Python runtime can load it, or the user can download it
 
-It answers questions like: "What artifacts exist?", "What columns does `customers_last_month` have?", "Give me the Parquet bytes."
+It answers questions like: "What artifacts exist?", "What columns does `customers_last_month` have?", "Show me a few sample rows.", "Give me the Parquet bytes.", "How much quota is this session using?", and "Which artifacts are eligible for cleanup?"
 
 ### SQL Runtime (port 8010)
 
@@ -120,7 +124,16 @@ Like the SQL runtime, this is stateless and isolated.
 An artifact is a saved result — typically a table (Parquet file) but could also be a chart, file, or report. Artifacts are:
 - **Runtime-independent** — stored in object storage, not tied to any execution environment
 - **Reusable** — the agent can reference them in later steps
-- **Tracked** — schema, lineage, and statistics are recorded in the catalog
+- **Tracked** — schema, lineage, statistics, preview rows, retention metadata, and cleanup status are recorded in the catalog
+
+Artifacts now participate in a retention model:
+- **Retention classes** determine the default lifecycle (`temporary`, `reusable`, `pinned`, `persistent`)
+- **Pinning** protects an artifact from automatic cleanup until it is explicitly unpinned
+- **Expiration** is tracked per artifact using `expires_at`; reads also refresh `last_accessed_at` so cleanup decisions can factor in recent usage
+- **Quota** is the storage budget for a session. The system tracks how many artifact bytes a session is currently using and compares that against a configured limit
+- **Quota enforcement** is session-scoped; the Artifact Service can report quota usage, list eviction candidates, and evict eligible artifacts when a session exceeds its storage budget
+- **Eviction** applies only to unpinned, non-persistent artifacts. The system records why something was evicted, such as expired retention or quota pressure
+- **Session cleanup coordination** means expired-session cleanup in the Agent Service now triggers Artifact Service cleanup for that session first. Unpinned, non-persistent artifacts are evicted with a `session_expired` reason before the session record is removed; pinned and persistent artifacts are preserved
 
 ### Connections
 
@@ -128,7 +141,11 @@ A connection defines how to reach a data source: type (SQLite, PostgreSQL, etc.)
 
 ### Sessions
 
-A session is the workspace for a conversation. It tracks: messages, artifacts produced, and which connections are accessible. Persisted in Postgres (messages and artifact references stored as JSONB). Sessions survive service restarts.
+A session is the workspace for a conversation. It tracks: messages, artifacts produced, and which connections are accessible. Persisted in Postgres (messages and artifact references stored as JSONB). Sessions survive service restarts, but they now also have lifecycle metadata:
+- `last_accessed_at` is refreshed when the session is used
+- `expires_at` is extended on activity
+- expired sessions can be cleaned up through the agent service, which now also coordinates artifact cleanup for the same session
+- if an expired `session_id` is reused later, the agent starts a fresh session state instead of loading stale history
 
 ### Skills
 
@@ -195,16 +212,13 @@ make agent          # Port 8000
 ## Testing
 
 ```bash
-# Step 1: Query data
-curl -s http://localhost:8000/chat \
-
-# Step 5: Topic-scoped user — finance user (SQL only, no Python)
+# Step 1: Topic-scoped user — finance user (SQL only, no Python)
 curl -s http://localhost:8000/chat \
   -H "Content-Type: application/json" \
   -d '{"session_id": "fin-1", "user_id": "finance-user", "message": "Show me revenue by product category"}' \
   | python -m json.tool
 
-# Step 6: Full-access user — analyst with all tools
+# Step 2: Full-access user — analyst with all tools
 curl -s http://localhost:8000/chat \
   -H "Content-Type: application/json" \
   -d '{"session_id": "analyst-1", "user_id": "analyst-user", "message": "Get all customers and filter to inactive ones"}' \
@@ -214,38 +228,6 @@ curl -s http://localhost:8000/chat \
 ## What's next
 
 See [app-specs/plan.md](app-specs/plan.md) for the full phased plan. The immediate next steps are:
-- Deferred execution / job manager
-- Retention + artifact previews
-- Workflow definitions + advanced skill
-
-# Step 3: Skill-guided analysis (churn skill activates on keyword)
-curl -s http://localhost:8000/chat \
-  -H "Content-Type: application/json" \
-  -d '{"session_id": "test-2", "message": "what is the customer churn?"}' \
-  | python -m json.tool
-
-# Step 4: Inspect artifact data (no new query, reads existing artifact)
-curl -s http://localhost:8000/chat \
-  -H "Content-Type: application/json" \
-  -d '{"session_id": "test-2", "message": "show me the actual rows"}' \
-  | python -m json.tool
-
-# Step 5: Topic-scoped user — finance user (SQL only, no Python)
-curl -s http://localhost:8000/chat \
-  -H "Content-Type: application/json" \
-  -d '{"session_id": "fin-1", "user_id": "finance-user", "message": "Show me revenue by product category"}' \
-  | python -m json.tool
-
-# Step 6: Full-access user — analyst with all tools
-curl -s http://localhost:8000/chat \
-  -H "Content-Type: application/json" \
-  -d '{"session_id": "analyst-1", "user_id": "analyst-user", "message": "Get all customers and filter to inactive ones"}' \
-  | python -m json.tool
-```
-
-## What's next
-
-See [app-specs/plan.md](app-specs/plan.md) for the full phased plan. The immediate next steps are:
-- Deferred execution / job manager
-- Retention + artifact previews
+- End-to-end validation of quota-triggered eviction behavior
+- Cleanup policy tuning and clearer operational validation for pinned vs unpinned artifact behavior
 - Workflow definitions + advanced skills

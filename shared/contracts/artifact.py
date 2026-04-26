@@ -20,6 +20,13 @@ class ArtifactStatus(str, Enum):
     READY = "ready"
     PENDING = "pending"
     FAILED = "failed"
+    EVICTED = "evicted"
+
+
+class ArtifactEvictionReason(str, Enum):
+    EXPIRED_RETENTION = "expired_retention"
+    QUOTA_PRESSURE = "quota_pressure"
+    SESSION_EXPIRED = "session_expired"
 
 
 class RetentionClass(str, Enum):
@@ -68,6 +75,8 @@ class CreateArtifactRequest(BaseModel):
     statistics: ArtifactStatistics | None = None
     lineage: ArtifactLineage | None = None
     retention_class: RetentionClass = RetentionClass.TEMPORARY
+    is_pinned: bool = False
+    expires_at: datetime | None = None
 
 
 class ArtifactRecord(BaseModel):
@@ -84,5 +93,46 @@ class ArtifactRecord(BaseModel):
     statistics: ArtifactStatistics | None = None
     preview: ArtifactPreview | None = None
     lineage: ArtifactLineage | None = None
+    extra_metadata: dict[str, Any] | None = None
     retention_class: RetentionClass = RetentionClass.TEMPORARY
+    is_pinned: bool = False
+    expires_at: datetime | None = None
+    last_accessed_at: datetime | None = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class ArtifactQuotaSummary(BaseModel):
+    session_id: str
+    quota_bytes: int
+    used_bytes: int
+    available_bytes: int
+    over_quota: bool
+    evictable_bytes: int
+
+
+class EvictedArtifactInfo(BaseModel):
+    artifact_id: str
+    name: str
+    reclaimed_bytes: int
+    reason: ArtifactEvictionReason
+
+
+class ArtifactEvictionCandidate(BaseModel):
+    artifact_id: str
+    session_id: str
+    name: str
+    retention_class: RetentionClass
+    size_bytes: int
+    expires_at: datetime | None = None
+    last_accessed_at: datetime | None = None
+    reason: ArtifactEvictionReason
+    priority_rank: int
+
+
+class ArtifactEvictionResult(BaseModel):
+    session_id: str
+    quota_bytes: int
+    used_bytes_before: int
+    used_bytes_after: int
+    reclaimed_bytes: int
+    evicted_artifacts: list[EvictedArtifactInfo]

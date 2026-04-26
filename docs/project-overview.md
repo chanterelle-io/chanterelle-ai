@@ -4,9 +4,9 @@
 Analytics Agent Platform — session-based analytical workspace where a user interacts with an AI agent to retrieve, analyze, and generate outputs from connected data sources.
 
 ## Architecture
-- **Agent Service** (port 8000): Orchestration, LLM tool-use loop, session management
+- **Agent Service** (port 8000): Orchestration, LLM tool-use loop, session management, session expiration and cleanup
 - **Execution Service** (port 8001): Execution request validation, connection registry, runtime registry, skill registry, policy registry, topic profile registry, policy evaluation, runtime routing, credential injection, query analysis, deferred execution (job manager)
-- **Artifact Service** (port 8002): Artifact catalog (Postgres), object storage (MinIO/S3), Parquet persistence
+- **Artifact Service** (port 8002): Artifact catalog (Postgres), object storage (MinIO/S3), Parquet persistence, retention, pin/unpin, quota tracking, eviction
 - **SQL Runtime** (port 8010): Executes SQL against connected sources, returns Parquet
 - **Python Runtime** (port 8011): Executes Python transforms on DataFrames, returns Parquet
 
@@ -20,6 +20,7 @@ Analytics Agent Platform — session-based analytical workspace where a user int
 
 ## Key Design Decisions
 - Artifacts are runtime-independent, stored as Parquet in object storage
+- Artifact retention is session-scoped by default: TTLs, pinning, quota accounting, and eviction are enforced in the Artifact Service
 - Agent picks tools/intent; execution manager picks runtime/mode
 - Skills (guidance) are separate from tools (actions)
 - Credentials injected just-in-time, never exposed to agent
@@ -29,7 +30,8 @@ Analytics Agent Platform — session-based analytical workspace where a user int
 - Topic profiles scope what tools, connections, and skills a user can access
 - Deferred execution: server-side query analysis triggers background jobs for large/unbounded queries
 - Policy conditions are server-side only — agent hints are optional fallback, not the source of truth
-- Sessions persisted in Postgres (messages + artifact refs as JSONB)
+- Sessions persisted in Postgres (messages + artifact refs as JSONB) with expiry and cleanup metadata
+- Expired-session cleanup coordinates with artifact cleanup: unpinned, non-persistent artifacts are evicted first and pinned artifacts are preserved
 
 ## Commands
 - `make infra` — start Postgres + MinIO + seed policies + seed topic profiles + seed user assignments
@@ -37,6 +39,7 @@ Analytics Agent Platform — session-based analytical workspace where a user int
 - `make migrate-phase3` — add skills table + connection auth columns to existing DB
 - `make migrate-phase4` — add policies, topic_profiles, user_topic_assignments tables to existing DB
 - `make migrate-phase5` — add jobs table to existing DB
+- `make migrate-phase6` — add artifact retention and session lifecycle fields, and backfill seeded topic tool permissions
 - `make artifact` / `make runtime-sql` / `make runtime-python` / `make execution` / `make agent` — start each service
 - `make infra-down` — stop infrastructure
 

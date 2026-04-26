@@ -18,6 +18,8 @@ from services.agent.tools.sql_query import SQL_QUERY_TOOL
 from services.agent.tools.python_transform import PYTHON_TRANSFORM_TOOL
 from services.agent.tools.inspect_artifact import INSPECT_ARTIFACT_TOOL
 from services.agent.tools.check_job import CHECK_JOB_STATUS_TOOL
+from services.agent.tools.pin_artifact import PIN_ARTIFACT_TOOL
+from services.agent.tools.unpin_artifact import UNPIN_ARTIFACT_TOOL
 from shared.contracts.connection import ConnectionRecord
 from shared.contracts.execution import (
     ExecutionRequest,
@@ -67,10 +69,15 @@ class Orchestrator:
         if topic_context and topic_context.active_skill_ids:
             skills = [s for s in skills if s.id in topic_context.active_skill_ids]
 
-        system_prompt = self._build_system_prompt(connections, artifacts, skills, topic_context)
-
         # Build tool list, filtered by topic profile
-        all_tools = [SQL_QUERY_TOOL, PYTHON_TRANSFORM_TOOL, INSPECT_ARTIFACT_TOOL, CHECK_JOB_STATUS_TOOL]
+        all_tools = [
+            SQL_QUERY_TOOL,
+            PYTHON_TRANSFORM_TOOL,
+            INSPECT_ARTIFACT_TOOL,
+            PIN_ARTIFACT_TOOL,
+            UNPIN_ARTIFACT_TOOL,
+            CHECK_JOB_STATUS_TOOL,
+        ]
         if topic_context and topic_context.allowed_tool_names:
             # Always include check_job_status regardless of topic profile
             tools = [
@@ -79,6 +86,14 @@ class Orchestrator:
             ]
         else:
             tools = all_tools
+
+        system_prompt = self._build_system_prompt(
+            connections,
+            artifacts,
+            tools,
+            skills,
+            topic_context,
+        )
 
         # Add user message
         session.messages.append({"role": "user", "content": user_message})
@@ -159,6 +174,10 @@ class Orchestrator:
             return await self._execute_python_transform(session, tool_call.input, user_id=user_id)
         if tool_call.name == "inspect_artifact":
             return await self._execute_inspect_artifact(session, tool_call.input)
+        if tool_call.name == "pin_artifact":
+            return await self._execute_pin_artifact(session, tool_call.input)
+        if tool_call.name == "unpin_artifact":
+            return await self._execute_unpin_artifact(session, tool_call.input)
         if tool_call.name == "check_job_status":
             return await self._execute_check_job_status(session, tool_call.input)
         return f"Unknown tool: {tool_call.name}", None, False
@@ -282,13 +301,7 @@ class Orchestrator:
         artifact_name = tool_input.get("artifact_name", "")
         max_rows = min(tool_input.get("max_rows", 5), 20)  # cap at 20
 
-        # Resolve artifact name to ID
-        all_artifacts = await self._fetch_session_artifacts(session.id)
-        artifact = None
-        for a in all_artifacts:
-            if a["name"] == artifact_name:
-                artifact = a
-                break
+        artifact = await self._resolve_artifact_by_name(session.id, artifact_name)
         if not artifact:
             return f"Artifact '{artifact_name}' not found in this session.", None, False
 
@@ -333,6 +346,59 @@ class Orchestrator:
             f"**Artifact: {artifact_name}** ({row_count} rows, {len(columns)} columns)\n\n"
             f"Columns:\n{col_details}\n\n"
             f"Sample rows (first {max_rows}):\n{sample_str}"
+        ), None, False
+
+    async def _execute_pin_artifact(
+        self, session: Session, tool_input: dict
+    ) -> tuple[str, str | None, bool]:
+        artifact_name = tool_input.get("artifact_name", "")
+        artifact = await self._resolve_artifact_by_name(session.id, artifact_name)
+        if not artifact:
+            return f"Artifact '{artifact_name}' not found in this session.", None, False
+
+        artifact_id = artifact["id"]
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(
+                    f"{settings.artifact_service_url}/artifacts/{artifact_id}/pin"
+                )
+                resp.raise_for_status()
+            updated = resp.json()
+        except Exception as e:
+            return f"Error pinning artifact '{artifact_name}': {e}", None, False
+
+        return (
+            f"Artifact '{updated.get('name', artifact_name)}' is now pinned and protected from automatic cleanup."
+        ), None, False
+
+    async def _execute_unpin_artifact(
+        self, session: Session, tool_input: dict
+    ) -> tuple[str, str | None, bool]:
+        artifact_name = tool_input.get("artifact_name", "")
+        artifact = await self._resolve_artifact_by_name(session.id, artifact_name)
+        if not artifact:
+            return f"Artifact '{artifact_name}' not found in this session.", None, False
+
+        artifact_id = artifact["id"]
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(
+                    f"{settings.artifact_service_url}/artifacts/{artifact_id}/unpin"
+                )
+                resp.raise_for_status()
+            updated = resp.json()
+        except Exception as e:
+            return f"Error unpinning artifact '{artifact_name}': {e}", None, False
+
+        expires_at = updated.get("expires_at")
+        if expires_at:
+            return (
+                f"Artifact '{updated.get('name', artifact_name)}' is no longer pinned and will follow normal retention rules again. "
+                f"Current expiration: {expires_at}."
+            ), None, False
+
+        return (
+            f"Artifact '{updated.get('name', artifact_name)}' is no longer pinned and will follow normal retention rules again."
         ), None, False
 
     def _rows_to_csv(self, rows: list[dict[str, Any]]) -> str:
@@ -410,6 +476,8 @@ class Orchestrator:
         stats = data.get("statistics") or {}
         schema = data.get("schema_info") or {}
         columns = schema.get("columns", [])
+        preview = data.get("preview") or {}
+        preview_rows = preview.get("sample_rows") or []
 
         row_count = stats.get("row_count", "unknown")
         col_names = [c["name"] + f" ({c['logical_type']})" for c in columns]
@@ -417,10 +485,20 @@ class Orchestrator:
         if len(col_names) > 10:
             columns_str += f", ... and {len(col_names) - 10} more"
 
-        return (
+        summary = (
             f"Query executed successfully. Artifact '{name}' created with {row_count} rows.\n"
             f"Columns: {columns_str}"
         )
+
+        if preview_rows:
+            preview_limit = min(len(preview_rows), 3)
+            preview_str = self._rows_to_csv(preview_rows[:preview_limit]).strip()
+            if preview_str:
+                summary += (
+                    f"\nPreview rows (first {preview_limit}):\n{preview_str}"
+                )
+
+        return summary
 
     # --- Context gathering ---
 
@@ -446,6 +524,13 @@ class Orchestrator:
         except Exception as e:
             logger.warning("Failed to fetch artifacts: %s", e)
             return []
+
+    async def _resolve_artifact_by_name(self, session_id: str, artifact_name: str) -> dict | None:
+        all_artifacts = await self._fetch_session_artifacts(session_id)
+        for artifact in all_artifacts:
+            if artifact["name"] == artifact_name:
+                return artifact
+        return None
 
     async def _fetch_skills(
         self, connection_names: list[str], user_message: str
@@ -487,7 +572,10 @@ class Orchestrator:
     # --- Prompt building ---
 
     def _build_system_prompt(
-        self, connections: list[ConnectionRecord], artifacts: list[dict],
+        self,
+        connections: list[ConnectionRecord],
+        artifacts: list[dict],
+        tools: list[ToolDefinition],
         skills: list[SkillRecord] | None = None,
         topic_context: ResolvedTopicContext | None = None,
     ) -> str:
@@ -507,6 +595,11 @@ class Orchestrator:
             parts.append("No connections available.")
 
         parts.append("")
+        parts.append("## Available tools for this turn")
+        for tool in tools:
+            parts.append(f"- **{tool.name}**: {tool.description}")
+
+        parts.append("")
         parts.append("## Session artifacts")
 
         if artifacts:
@@ -516,7 +609,14 @@ class Orchestrator:
                 col_summary = ", ".join(c["name"] for c in cols[:8])
                 stats = a.get("statistics") or {}
                 rows = stats.get("row_count", "?")
-                parts.append(f"- **{a['name']}** ({rows} rows): [{col_summary}]")
+                status_bits = []
+                if a.get("is_pinned"):
+                    status_bits.append("pinned")
+                expires_at = a.get("expires_at")
+                if expires_at:
+                    status_bits.append(f"expires {expires_at}")
+                status_suffix = f" [{'; '.join(status_bits)}]" if status_bits else ""
+                parts.append(f"- **{a['name']}** ({rows} rows): [{col_summary}]{status_suffix}")
         else:
             parts.append("No artifacts in this session yet.")
 
@@ -529,6 +629,8 @@ class Orchestrator:
             "- When using transform_with_python, input artifacts are available as pandas DataFrames with the variable names matching the artifact aliases.",
             "- Your code must assign the final result to a variable called `result` (a DataFrame).",
             "- Use the inspect_artifact tool to look at sample rows or column details of an existing artifact.",
+            "- Use the pin_artifact tool when the user wants to keep an artifact available for later.",
+            "- Use the unpin_artifact tool when the user wants to remove that cleanup protection.",
             "- Give artifacts clear, descriptive snake_case names.",
             "- After getting results, summarize what was found.",
             "- You can reference prior artifacts by name when the user asks follow-up questions.",
@@ -537,6 +639,7 @@ class Orchestrator:
             "- Only use inspect_artifact when you genuinely need to see data values. You already get column names and row counts from query results.",
             "- Large SQL queries and large Python transforms may be routed to background processing by the execution service.",
             "- If a tool call is deferred (runs as a background job), tell the user and use check_job_status to check on it later.",
+            "- Do not claim a tool is unavailable unless it is absent from the 'Available tools for this turn' list above.",
         ])
 
         # Active skills

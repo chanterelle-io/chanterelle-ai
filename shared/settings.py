@@ -10,6 +10,8 @@ class Settings(BaseSettings):
     s3_access_key: str = "minioadmin"
     s3_secret_key: str = "minioadmin"
     s3_bucket: str = "artifacts"
+    artifact_session_quota_bytes: int = 50 * 1024 * 1024
+    session_ttl_hours: int = 24 * 7
 
     # LLM
     anthropic_api_key: str = ""

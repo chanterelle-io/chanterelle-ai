@@ -1,5 +1,10 @@
 # Development Status
 
+## Current Phase: Phase 6 — Retention + Previews + Polish
+Status: **In progress — artifact previews started**
+
+Phase 5 is complete and tested end-to-end. Phase 6 work has begun with cached artifact previews in the Artifact Service and agent-side reuse of those previews during inspection.
+
 ## Phase 1 — Core Loop ✓
 Status: **Complete — tested end-to-end**
 
@@ -189,6 +194,52 @@ Status: **Complete — tested end-to-end**
 - Policies are fully server-side — the agent cannot influence or bypass policy decisions
 - Query analysis is lightweight: table metadata lookups + pattern detection, never re-executes the user's query
 - The `parameters` dict on ExecutionRequest provides an extension point for structured agent hints, but server-side analysis is the primary signal
+
+## Phase 6 — Retention + Previews + Polish
+Status: **In progress — retention, previews, and session cleanup foundation implemented**
+
+### What's Built So Far
+
+#### 6.1 Retention Foundation
+- [x] `shared/contracts/artifact.py` — added retention fields (`is_pinned`, `expires_at`, `last_accessed_at`), quota summary models, and eviction result models
+- [x] `services/artifact/catalog.py` — applies retention TTL defaults, updates access timestamps, computes quota usage, lists eviction candidates, and marks artifacts as evicted
+- [x] `services/artifact/app.py` — added `GET /artifacts/quota`, `GET /artifacts/eviction-candidates`, `POST /artifacts/evict`, and automatic quota enforcement on upload
+- [x] `services/artifact/store.py` — added object deletion for eviction
+- [x] `scripts/migrate_phase6.py` + `Makefile` — migration target for retention foundation fields
+
+#### 6.2 Pin/Unpin Flows
+- [x] `services/artifact/app.py` — added `POST /artifacts/{id}/pin` and `POST /artifacts/{id}/unpin`
+- [x] `services/agent/tools/pin_artifact.py` + `unpin_artifact.py` — added agent tool definitions for cleanup protection control
+- [x] `services/agent/orchestrator.py` — wired pin/unpin tool execution and surfaced artifact pin/expiry state in session context
+- [x] `scripts/seed.py` — topic profile tool allowlists now include pin/unpin tools
+
+#### 6.3 Artifact Previews
+- [x] `shared/contracts/artifact.py` — added `ArtifactPreview` and `preview` on `ArtifactRecord`
+- [x] `services/artifact/app.py` — generates a cached sample-row preview when Parquet artifacts are uploaded
+- [x] `services/artifact/catalog.py` — stores preview metadata in `extra_metadata` and returns it as part of artifact records
+- [x] `services/agent/orchestrator.py` — `inspect_artifact` uses cached preview rows first before downloading the full artifact
+- [x] `services/agent/orchestrator.py` — normal artifact summaries now include cached preview rows when available
+
+#### 6.4 Stabilization
+- [x] Fixed preview metadata persistence to PostgreSQL `jsonb` by serializing `extra_metadata` before write
+
+### Next Up in Phase 6
+- [ ] Eviction policy tuning and richer cleanup reasoning
+- [ ] End-to-end runtime validation of quota-triggered eviction behavior
+- [x] End-to-end runtime validation of session-expiration cleanup behavior
+- [x] Session lifecycle cleanup and expiration foundation
+
+#### 6.5 Session Lifecycle
+- [x] `shared/settings.py` — added configurable session TTL via `session_ttl_hours`
+- [x] `db/init.sql` + `scripts/migrate_phase6.py` — added `last_accessed_at` and `expires_at` for sessions
+- [x] `services/agent/session.py` — refreshes session expiry on use, resets expired sessions on reuse, and exposes expired-session cleanup
+- [x] `services/agent/app.py` — added `GET /sessions/{session_id}` and `POST /sessions/cleanup`
+- [x] `services/agent/session.py` + `services/artifact/app.py` — expired-session cleanup now coordinates with the Artifact Service so eligible artifacts are evicted with reason `session_expired` before the session row is deleted
+- [x] Live validation — forced session expiration plus cleanup evicts unpinned artifacts with `session_expired` and preserves pinned artifacts
+
+### Remaining Phase 6 Work
+- [ ] End-to-end runtime validation of quota-triggered eviction behavior
+- [ ] Cleanup policy tuning and operator-facing validation around pinned vs unpinned artifacts during session expiration
 
 ## Sample Data Source
 - SQLite at `data/sample.db`
