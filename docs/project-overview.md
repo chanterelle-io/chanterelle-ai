@@ -5,7 +5,7 @@ Analytics Agent Platform — session-based analytical workspace where a user int
 
 ## Architecture
 - **Agent Service** (port 8000): Orchestration, LLM tool-use loop, session management, session expiration and cleanup
-- **Execution Service** (port 8001): Execution request validation, connection registry, runtime registry, skill registry, policy registry, topic profile registry, policy evaluation, runtime routing, credential injection, query analysis, deferred execution (job manager)
+- **Execution Service** (port 8001): Execution request validation, connection registry, runtime registry, skill registry, workflow registry, policy registry, topic profile registry, policy evaluation, runtime routing, credential injection, query analysis, deferred execution (job manager)
 - **Artifact Service** (port 8002): Artifact catalog (Postgres), object storage (MinIO/S3), Parquet persistence, retention, pin/unpin, quota tracking, eviction
 - **SQL Runtime** (port 8010): Executes SQL against connected sources, returns Parquet
 - **Python Runtime** (port 8011): Executes Python transforms on DataFrames, returns Parquet
@@ -23,11 +23,14 @@ Analytics Agent Platform — session-based analytical workspace where a user int
 - Artifact retention is session-scoped by default: TTLs, pinning, quota accounting, and eviction are enforced in the Artifact Service
 - Agent picks tools/intent; execution manager picks runtime/mode
 - Skills (guidance) are separate from tools (actions)
+- Workflows provide higher-level multi-step guidance on top of skills
 - Credentials injected just-in-time, never exposed to agent
 - LLM provider is abstracted (`LLMProvider` ABC → `ClaudeProvider` impl)
 - Execution service routes to runtimes by tool type (SQL → sql runtime, Python → python runtime)
 - Policies evaluated at execution time — can deny tools/runtimes, force deferred mode, require approval
-- Topic profiles scope what tools, connections, and skills a user can access
+- Topic profiles scope what tools, connections, skills, and workflows a user can access
+- Workflow definitions can be resolved by request keywords and active topic-profile workflow ids, then injected into the agent prompt as ordered guidance and policy activation input
+- Workflow-scoped policies can now affect execution directly when a matched workflow activates them
 - Deferred execution: server-side query analysis triggers background jobs for large/unbounded queries
 - Policy conditions are server-side only — agent hints are optional fallback, not the source of truth
 - Sessions persisted in Postgres (messages + artifact refs as JSONB) with expiry and cleanup metadata
@@ -40,6 +43,8 @@ Analytics Agent Platform — session-based analytical workspace where a user int
 - `make migrate-phase4` — add policies, topic_profiles, user_topic_assignments tables to existing DB
 - `make migrate-phase5` — add jobs table to existing DB
 - `make migrate-phase6` — add artifact retention and session lifecycle fields, and backfill seeded topic tool permissions
+- `make migrate-phase7` — add workflow registry support to existing DB
+- `make migrate-phase8` — add topic-profile workflow allowlists to existing DB
 - `make artifact` / `make runtime-sql` / `make runtime-python` / `make execution` / `make agent` — start each service
 - `make infra-down` — stop infrastructure
 

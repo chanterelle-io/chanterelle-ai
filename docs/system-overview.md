@@ -16,6 +16,7 @@ Agent Service ──── "What do we have? What should I do?"
   │                    │                    │
   │              reads artifacts      reads connections
   │              + inspects data      + resolves skills
+  │                                  + resolves workflows
   │                                  + resolves topic profiles
   │                    │                    │
   │              Artifact Service    Execution Service
@@ -50,9 +51,9 @@ The brain. Receives user messages, talks to the LLM, decides which tools to use,
 
 On each turn:
 1. Loads the session (or creates a new one)
-2. If a `user_id` is provided, resolves the user's **topic profiles** — which tools, connections, and skills they're allowed to use
-3. Filters connections and fetches applicable skills (scoped by topic profile if active)
-4. Builds a system prompt with connections, artifacts, the active tool list for that turn, skill instructions, and topic constraints
+2. If a `user_id` is provided, resolves the user's **topic profiles** — which tools, connections, skills, and workflows they're allowed to use
+3. Filters connections and fetches applicable skills and workflows, including topic-profile workflow allowlists when present
+4. Builds a system prompt with connections, artifacts, the active tool list for that turn, skill instructions, workflow guidance, and topic constraints
 5. Sends the conversation to the LLM (only the tools allowed by the topic profile)
 6. If the LLM calls a tool (e.g. `query_sql_source`, `transform_with_python`, `inspect_artifact`, `pin_artifact`, or `unpin_artifact`), the agent executes it by calling the Execution Service or Artifact Service
 7. Feeds the tool result back to the LLM (including policy denial or deferred messages)
@@ -80,12 +81,12 @@ When a tool call comes in, the execution service:
 3. **Loads input artifacts** (for Python transforms) — downloads Parquet from Artifact Service and base64-encodes for the runtime
 4. **Calls the runtime** — sends the request over HTTP**skill registry**, **policy registry**, and **topic profile registry** — all stored in Postgres.
 
-Before executing, it evaluates **policies** against the request context (tool, connection type, user's topic profiles). Policies can deny tools, deny runtimes, force deferred execution, or require approval. If a policy blocks the request, the execution service returns a `denied` status instead of running anything
+Before executing, it evaluates **policies** against the request context (tool, connection type, user's topic profiles, and any explicitly activated workflow policies). Policies can deny tools, deny runtimes, force deferred execution, or require approval. If a policy blocks the request, the execution service returns a `denied` status instead of running anything
 5. **Handles the output** — takes the Parquet bytes from the runtime, registers the artifact via the Artifact Service (with lineage — source connection or parent artifacts), returns the artifact ID
 
-It owns the **connection registry**, **runtime registry**, **skill registry**, **policy registry**, and **topic profile registry** — all stored in Postgres.
+It owns the **connection registry**, **runtime registry**, **skill registry**, **workflow registry**, **policy registry**, and **topic profile registry** — all stored in Postgres.
 
-Before executing, it evaluates **policies** against the request context (tool, connection type, user's topic profiles). Policies can deny tools, deny runtimes, force deferred execution, or require approval. If a policy blocks the request, the execution service returns a `denied` status instead of running anything.
+Before executing, it evaluates **policies** against the request context (tool, connection type, user's topic profiles, and any matched workflow policy ids). Policies can deny tools, deny runtimes, force deferred execution, or require approval. If a policy blocks the request, the execution service returns a `denied` status instead of running anything.
 
 ### Artifact Service (port 8002)
 
@@ -131,9 +132,9 @@ Artifacts now participate in a retention model:
 - **Pinning** protects an artifact from automatic cleanup until it is explicitly unpinned
 - **Expiration** is tracked per artifact using `expires_at`; reads also refresh `last_accessed_at` so cleanup decisions can factor in recent usage
 - **Quota** is the storage budget for a session. The system tracks how many artifact bytes a session is currently using and compares that against a configured limit
-- **Quota enforcement** is session-scoped; the Artifact Service can report quota usage, list eviction candidates, and evict eligible artifacts when a session exceeds its storage budget
-- **Eviction** applies only to unpinned, non-persistent artifacts. The system records why something was evicted, such as expired retention or quota pressure
-- **Session cleanup coordination** means expired-session cleanup in the Agent Service now triggers Artifact Service cleanup for that session first. Unpinned, non-persistent artifacts are evicted with a `session_expired` reason before the session record is removed; pinned and persistent artifacts are preserved
+- **Quota enforcement** is session-scoped; the Artifact Service can report quota usage, list eviction candidates, and evict eligible artifacts when a session exceeds its storage budget. Quota eviction responses now also report `preserved_artifacts` for pinned or otherwise non-evictable items that remain
+- **Eviction** applies only to unpinned, non-persistent artifacts. The system records why something was evicted, such as expired retention or quota pressure. A session can remain over quota after an eviction attempt when only pinned or otherwise preserved artifacts are left
+- **Session cleanup coordination** means expired-session cleanup in the Agent Service now triggers Artifact Service cleanup for that session first. Unpinned, non-persistent artifacts are evicted with a `session_expired` reason before the session record is removed; pinned and persistent artifacts are preserved. The cleanup response now reports per-session evicted artifact ids plus `preserved_artifacts` with explicit reasons such as `pinned`, and leaves the session row in place if strict artifact cleanup fails
 
 ### Connections
 
@@ -156,7 +157,22 @@ Skills have:
 - **Scope** — global (always active), connection-scoped (active when a specific connection is involved), or keyword-triggered
 - **Instructions** — summary, recommended steps, dos/donts, output expectations
 
-Examples: "Sample DB Schema Guide" (connector skill — tells the agent the table structure), "Customer Churn Analysis" (metric skill — defines how to calculate churn, triggered by keywords like "churn" or "retention").
+Examples: "Sample DB Schema Guide" (connector skill — tells the agent the table structure), "Customer Churn Analysis" (metric skill — defines how to calculate churn, triggered by keywords like "churn" or "retention"), and "Revenue Analysis" (metric skill — defines how to aggregate revenue from `orders.amount`).
+
+### Workflows
+
+A workflow is higher-level guidance that describes a multi-step analysis shape. Workflows are not tools and they do not execute by themselves. They help the agent plan a sequence of analysis steps for a class of requests.
+
+Workflows have:
+- **Triggers** — keyword and optional topic-profile matching
+- **Steps** — ordered guidance with preferred tools or runtimes
+- **Output expectations** — the kinds of artifacts or summaries the workflow should produce
+
+Topic profiles can also carry explicit workflow allowlists. When present, the agent only resolves workflows whose ids are active for that user's topic context.
+
+Examples: "Churn Investigation Workflow" (identify the customer base, compute churn by segment, optionally refine a prior churn artifact with Python) and "Revenue Breakdown Workflow" (aggregate revenue, break down by category or period, and rank results).
+
+Workflows can also activate specific policies for execution-time enforcement. For example, the seeded revenue workflow activates a policy that denies `python_transform`, which keeps that workflow on a SQL-first path unless a different workflow explicitly permits later transformation behavior.
 
 ### Policies
 
@@ -176,7 +192,7 @@ Job states: submitted → running → completed/failed. Jobs store the original 
 
 ### Topic Profiles
 
-A topic profile defines a scoped workspace: which tools, connections, runtimes, skills, and policies are available. Users are assigned to one or more topic profiles. When the agent receives a request with a `user_id`, it resolves the user's active profiles and restricts everything accordingly.
+A topic profile defines a scoped workspace: which tools, connections, runtimes, skills, workflows, and policies are available. Users are assigned to one or more topic profiles. When the agent receives a request with a `user_id`, it resolves the user's active profiles and restricts everything accordingly.
 
 If no `user_id` is provided, the agent operates with full access (backward compatible).
 
@@ -228,6 +244,4 @@ curl -s http://localhost:8000/chat \
 ## What's next
 
 See [app-specs/plan.md](app-specs/plan.md) for the full phased plan. The immediate next steps are:
-- End-to-end validation of quota-triggered eviction behavior
-- Cleanup policy tuning and clearer operational validation for pinned vs unpinned artifact behavior
-- Workflow definitions + advanced skills
+- Workflow-aware runtime preferences beyond the current workflow policy activation path

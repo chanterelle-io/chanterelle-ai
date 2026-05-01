@@ -257,6 +257,40 @@ def seed_skills() -> None:
             }),
             "tags": json.dumps(["churn", "retention", "metrics"]),
         },
+        {
+            "name": "revenue_analysis",
+            "category": "metric",
+            "title": "Revenue Analysis",
+            "description": "Guidelines for revenue, sales, and order amount analysis.",
+            "scope": json.dumps({"level": "global"}),
+            "triggers": json.dumps([
+                {"kind": "keyword", "value": "revenue", "weight": 1.0},
+                {"kind": "keyword", "value": "sales", "weight": 0.9},
+                {"kind": "keyword", "value": "amount", "weight": 0.7},
+            ]),
+            "instructions": json.dumps({
+                "summary": (
+                    "When analyzing revenue, use orders.amount as the canonical measure. "
+                    "Prefer grouped summaries by product_category, segment, or time period in a single query."
+                ),
+                "recommended_steps": [
+                    "Aggregate orders.amount at the requested grain in one query",
+                    "Include totals and sort descending for top contributors when relevant",
+                ],
+                "dos": [
+                    "Use SUM(amount) for revenue totals",
+                    "Group by product_category or date bucket when the user asks for a breakdown",
+                ],
+                "donts": [
+                    "Don't approximate revenue from product price when order amounts already exist",
+                    "Don't run multiple queries when one grouped query can answer the question",
+                ],
+                "output_expectations": [
+                    "A clean revenue summary artifact with clear aggregation columns",
+                ],
+            }),
+            "tags": json.dumps(["revenue", "sales", "metrics"]),
+        },
     ]
 
     with engine.connect() as conn:
@@ -290,6 +324,149 @@ def seed_skills() -> None:
         conn.commit()
 
 
+def seed_workflows() -> None:
+    engine = get_engine()
+
+    with engine.connect() as conn:
+        skills_map = {}
+        rows = conn.execute(text("SELECT id, name FROM skills")).fetchall()
+        for row in rows:
+            skills_map[row[1]] = str(row[0])
+
+    churn_skill_id = skills_map.get("churn_analysis", "")
+    revenue_skill_id = skills_map.get("revenue_analysis", "")
+    connector_skill_id = skills_map.get("sample_db_connector", "")
+
+    workflows = [
+        {
+            "name": "churn_investigation",
+            "version": "1.0.0",
+            "title": "Churn Investigation Workflow",
+            "description": "Guide the analysis through customer selection, inactivity detection, and segment-level churn summary.",
+            "triggers": json.dumps({
+                "keywords": ["churn", "retention", "inactive"],
+            }),
+            "steps": json.dumps([
+                {
+                    "step_id": "identify_customer_base",
+                    "order": 1,
+                    "title": "Identify candidate customers",
+                    "description": "Query the customer population and relevant recent order activity needed for churn logic.",
+                    "preferred_tool": "query_sql_source",
+                    "preferred_runtime_type": "sql",
+                },
+                {
+                    "step_id": "compute_churn_segments",
+                    "order": 2,
+                    "title": "Compute churn by segment",
+                    "description": "Aggregate churn counts and rates by segment in the same result when possible.",
+                    "preferred_tool": "query_sql_source",
+                    "preferred_runtime_type": "sql",
+                },
+                {
+                    "step_id": "refine_with_python",
+                    "order": 3,
+                    "title": "Refine a prior churn artifact if needed",
+                    "description": "Use Python only when the user asks for a follow-up filter or derived view on a prior churn result.",
+                    "preferred_tool": "transform_with_python",
+                    "preferred_runtime_type": "python",
+                    "is_optional": True,
+                },
+            ]),
+            "required_skill_ids": json.dumps([sid for sid in [connector_skill_id, churn_skill_id] if sid]),
+            "active_policy_ids": json.dumps([]),
+            "output_expectations": json.dumps([
+                "A segment-level churn table with counts and rates",
+            ]),
+            "scope": json.dumps({"level": "global"}),
+            "tags": json.dumps(["churn", "retention", "workflow"]),
+            "metadata": json.dumps({"domain": "customer_health"}),
+        },
+        {
+            "name": "revenue_breakdown",
+            "version": "1.0.0",
+            "title": "Revenue Breakdown Workflow",
+            "description": "Guide the analysis through revenue aggregation, breakdown, and optional artifact refinement.",
+            "triggers": json.dumps({
+                "keywords": ["revenue", "sales"],
+            }),
+            "steps": json.dumps([
+                {
+                    "step_id": "aggregate_revenue",
+                    "order": 1,
+                    "title": "Aggregate revenue",
+                    "description": "Build a SQL query that sums orders.amount at the requested grain.",
+                    "preferred_tool": "query_sql_source",
+                    "preferred_runtime_type": "sql",
+                },
+                {
+                    "step_id": "breakdown_and_rank",
+                    "order": 2,
+                    "title": "Break down and rank",
+                    "description": "Return the requested category, segment, or date-bucket breakdown with sensible ordering.",
+                    "preferred_tool": "query_sql_source",
+                    "preferred_runtime_type": "sql",
+                },
+            ]),
+            "required_skill_ids": json.dumps([sid for sid in [connector_skill_id, revenue_skill_id] if sid]),
+            "active_policy_ids": json.dumps([]),
+            "output_expectations": json.dumps([
+                "A revenue summary table with grouping columns and aggregated totals",
+            ]),
+            "scope": json.dumps({"level": "global"}),
+            "tags": json.dumps(["revenue", "sales", "workflow"]),
+            "metadata": json.dumps({"domain": "finance"}),
+        },
+    ]
+
+    with engine.connect() as conn:
+        for workflow in workflows:
+            existing = conn.execute(
+                text("SELECT id FROM workflows WHERE name = :name"),
+                {"name": workflow["name"]},
+            ).fetchone()
+
+            if existing:
+                conn.execute(
+                    text("""
+                        UPDATE workflows
+                        SET version = :version,
+                            title = :title,
+                            description = :description,
+                            triggers = :triggers,
+                            steps = :steps,
+                            required_skill_ids = :required_skill_ids,
+                            active_policy_ids = :active_policy_ids,
+                            output_expectations = :output_expectations,
+                            scope = :scope,
+                            tags = :tags,
+                            metadata = :metadata,
+                            updated_at = NOW()
+                        WHERE name = :name
+                    """),
+                    workflow,
+                )
+                print(f"Updated workflow '{workflow['name']}'")
+            else:
+                conn.execute(
+                    text("""
+                        INSERT INTO workflows (
+                            name, version, title, description, triggers, steps,
+                            required_skill_ids, active_policy_ids, output_expectations,
+                            scope, tags, metadata
+                        )
+                        VALUES (
+                            :name, :version, :title, :description, :triggers, :steps,
+                            :required_skill_ids, :active_policy_ids, :output_expectations,
+                            :scope, :tags, :metadata
+                        )
+                    """),
+                    workflow,
+                )
+                print(f"Created workflow '{workflow['name']}'")
+        conn.commit()
+
+
 def seed_policies() -> None:
     engine = get_engine()
 
@@ -313,6 +490,16 @@ def seed_policies() -> None:
             "effect": json.dumps({"force_execution_mode": "deferred"}),
             "priority": 5,
             "tags": json.dumps(["performance"]),
+        },
+        {
+            "name": "deny_python_for_revenue_workflow",
+            "type": "workflow_preference",
+            "description": "Revenue workflow stays in SQL unless a later workflow explicitly allows Python.",
+            "scope": json.dumps({"level": "global"}),
+            "condition": json.dumps({"tool_names": ["python_transform"]}),
+            "effect": json.dumps({"denied_tool_names": ["python_transform"]}),
+            "priority": 12,
+            "tags": json.dumps(["workflow", "revenue", "sql-first"]),
         },
     ]
 
@@ -363,6 +550,29 @@ def seed_policies() -> None:
             conn.commit()
             print("Linked policy 'deny_python_for_finance' to finance_analysis topic")
 
+    with engine.connect() as conn:
+        revenue_policy = conn.execute(
+            text("SELECT id FROM policies WHERE name = 'deny_python_for_revenue_workflow'")
+        ).fetchone()
+        revenue_workflow = conn.execute(
+            text("SELECT id FROM workflows WHERE name = 'revenue_breakdown'")
+        ).fetchone()
+        if revenue_policy and revenue_workflow:
+            conn.execute(
+                text("""
+                    UPDATE workflows
+                    SET active_policy_ids = :active_policy_ids,
+                        updated_at = NOW()
+                    WHERE id = :workflow_id
+                """),
+                {
+                    "workflow_id": str(revenue_workflow[0]),
+                    "active_policy_ids": json.dumps([str(revenue_policy[0])]),
+                },
+            )
+            conn.commit()
+            print("Linked policy 'deny_python_for_revenue_workflow' to revenue_breakdown workflow")
+
 
 def seed_topic_profiles() -> None:
     engine = get_engine()
@@ -374,8 +584,16 @@ def seed_topic_profiles() -> None:
         for row in rows:
             skills_map[row[1]] = str(row[0])
 
+        workflows_map = {}
+        rows = conn.execute(text("SELECT id, name FROM workflows")).fetchall()
+        for row in rows:
+            workflows_map[row[1]] = str(row[0])
+
     connector_skill_id = skills_map.get("sample_db_connector", "")
     churn_skill_id = skills_map.get("churn_analysis", "")
+    revenue_skill_id = skills_map.get("revenue_analysis", "")
+    churn_workflow_id = workflows_map.get("churn_investigation", "")
+    revenue_workflow_id = workflows_map.get("revenue_breakdown", "")
 
     profiles = [
         {
@@ -390,7 +608,12 @@ def seed_topic_profiles() -> None:
             ]),
             "allowed_connection_names": json.dumps(["sample_db"]),
             "allowed_runtime_types": json.dumps(["sql"]),
-            "active_skill_ids": json.dumps([connector_skill_id] if connector_skill_id else []),
+            "active_skill_ids": json.dumps(
+                [sid for sid in [connector_skill_id, revenue_skill_id] if sid]
+            ),
+            "active_workflow_ids": json.dumps(
+                [wid for wid in [revenue_workflow_id] if wid]
+            ),
             "active_policy_ids": json.dumps([]),
             "domains": json.dumps(["finance"]),
             "tags": json.dumps(["finance", "restricted"]),
@@ -409,7 +632,10 @@ def seed_topic_profiles() -> None:
             "allowed_connection_names": json.dumps(["sample_db"]),
             "allowed_runtime_types": json.dumps(["sql", "python"]),
             "active_skill_ids": json.dumps(
-                [sid for sid in [connector_skill_id, churn_skill_id] if sid]
+                [sid for sid in [connector_skill_id, churn_skill_id, revenue_skill_id] if sid]
+            ),
+            "active_workflow_ids": json.dumps(
+                [wid for wid in [churn_workflow_id, revenue_workflow_id] if wid]
             ),
             "active_policy_ids": json.dumps([]),
             "domains": json.dumps([]),
@@ -433,6 +659,7 @@ def seed_topic_profiles() -> None:
                             allowed_connection_names = :allowed_connection_names,
                             allowed_runtime_types = :allowed_runtime_types,
                             active_skill_ids = :active_skill_ids,
+                            active_workflow_ids = :active_workflow_ids,
                             active_policy_ids = :active_policy_ids,
                             domains = :domains, tags = :tags
                         WHERE name = :name
@@ -446,10 +673,10 @@ def seed_topic_profiles() -> None:
                         INSERT INTO topic_profiles
                             (name, display_name, description, allowed_tool_names,
                              allowed_connection_names, allowed_runtime_types,
-                             active_skill_ids, active_policy_ids, domains, tags)
+                             active_skill_ids, active_workflow_ids, active_policy_ids, domains, tags)
                         VALUES (:name, :display_name, :description, :allowed_tool_names,
                                 :allowed_connection_names, :allowed_runtime_types,
-                                :active_skill_ids, :active_policy_ids, :domains, :tags)
+                            :active_skill_ids, :active_workflow_ids, :active_policy_ids, :domains, :tags)
                     """),
                     profile,
                 )
@@ -502,6 +729,7 @@ if __name__ == "__main__":
     seed_connection(db_path)
     seed_runtimes()
     seed_skills()
+    seed_workflows()
     seed_topic_profiles()  # Must be before policies (policies reference profiles)
     seed_policies()
     print("\nDone. You can now start the services.")

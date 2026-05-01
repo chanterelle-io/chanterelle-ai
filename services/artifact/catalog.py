@@ -10,12 +10,14 @@ from shared.contracts.artifact import (
     ArtifactEvictionCandidate,
     ArtifactEvictionReason,
     ArtifactEvictionResult,
+    ArtifactPreservationReason,
     ArtifactPreview,
     ArtifactQuotaSummary,
     ArtifactRecord,
     ArtifactStatus,
     CreateArtifactRequest,
     EvictedArtifactInfo,
+    PreservedArtifactInfo,
     RetentionClass,
 )
 from shared.db import get_engine
@@ -351,6 +353,7 @@ class ArtifactCatalog:
         quota_bytes: int,
         used_bytes_before: int,
         evicted_artifacts: list[EvictedArtifactInfo],
+        preserved_artifacts: list[PreservedArtifactInfo] | None = None,
     ) -> ArtifactEvictionResult:
         used_bytes_after = self.get_quota_summary(session_id, quota_bytes).used_bytes
         reclaimed_bytes = sum(item.reclaimed_bytes for item in evicted_artifacts)
@@ -361,7 +364,45 @@ class ArtifactCatalog:
             used_bytes_after=used_bytes_after,
             reclaimed_bytes=reclaimed_bytes,
             evicted_artifacts=evicted_artifacts,
+            preserved_artifacts=preserved_artifacts or [],
         )
+
+    def list_session_preserved_artifacts(
+        self,
+        session_id: str,
+        evicted_artifact_ids: set[str],
+    ) -> list[PreservedArtifactInfo]:
+        engine = get_engine()
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("""
+                    SELECT id, name, status, storage_uri, is_pinned, retention_class
+                    FROM artifacts
+                    WHERE session_id = :session_id
+                    ORDER BY created_at
+                """),
+                {"session_id": session_id},
+            ).mappings().fetchall()
+
+        preserved_artifacts: list[PreservedArtifactInfo] = []
+        for row in rows:
+            artifact_id = str(row["id"])
+            if artifact_id in evicted_artifact_ids:
+                continue
+
+            reason = self._session_cleanup_preservation_reason_for_row(row)
+            if reason is None:
+                continue
+
+            preserved_artifacts.append(
+                PreservedArtifactInfo(
+                    artifact_id=artifact_id,
+                    name=row["name"],
+                    reason=reason,
+                )
+            )
+
+        return preserved_artifacts
 
     def _default_expiration(
         self,
@@ -389,6 +430,23 @@ class ArtifactCatalog:
         if expires_at is not None and expires_at <= as_of:
             return ArtifactEvictionReason.EXPIRED_RETENTION
         return ArtifactEvictionReason.QUOTA_PRESSURE
+
+    def _session_cleanup_preservation_reason_for_row(
+        self,
+        row,
+    ) -> ArtifactPreservationReason | None:
+        if row.get("status") == ArtifactStatus.EVICTED.value:
+            return ArtifactPreservationReason.ALREADY_EVICTED
+        if row.get("is_pinned"):
+            return ArtifactPreservationReason.PINNED
+        if row.get("retention_class") in {
+            RetentionClass.PERSISTENT.value,
+            RetentionClass.PINNED.value,
+        }:
+            return ArtifactPreservationReason.PERSISTENT
+        if row.get("storage_uri") is None:
+            return ArtifactPreservationReason.NO_STORED_DATA
+        return None
 
     def _row_to_record(self, row) -> ArtifactRecord:
         schema_info = None

@@ -30,6 +30,7 @@ class ExecutionRequest(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     session_id: str
     user_id: str | None = None
+    active_policy_ids: list[str] = []
     tool: ToolInvocation
     target: ExecutionTarget | None = None
     input_artifacts: list[ExecutionArtifactInput] = []

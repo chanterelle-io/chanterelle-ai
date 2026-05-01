@@ -9,6 +9,7 @@ from shared.contracts.skill import SkillRecord
 from shared.contracts.policy import PolicyRecord, PolicyEvaluation
 from shared.contracts.topic import TopicProfile, UserTopicAssignment, ResolvedTopicContext
 from shared.contracts.job import JobRecord
+from shared.contracts.workflow import WorkflowRecord
 from services.execution.manager import ExecutionManager
 
 logging.basicConfig(level=logging.INFO)
@@ -49,6 +50,26 @@ def resolve_skills(
     return manager.get_skills_for_context(
         connection_names=conn_names,
         user_message=user_message,
+    )
+
+
+@app.get("/workflows", response_model=list[WorkflowRecord])
+def list_workflows() -> list[WorkflowRecord]:
+    return manager.list_workflows()
+
+
+@app.get("/workflows/resolve", response_model=list[WorkflowRecord])
+def resolve_workflows(
+    user_message: str | None = None,
+    topic_profile_ids: str | None = None,
+    active_workflow_ids: str | None = None,
+) -> list[WorkflowRecord]:
+    profile_ids = topic_profile_ids.split(",") if topic_profile_ids else None
+    workflow_ids = active_workflow_ids.split(",") if active_workflow_ids else None
+    return manager.get_workflows_for_context(
+        user_message=user_message,
+        topic_profile_ids=profile_ids,
+        active_workflow_ids=workflow_ids,
     )
 
 

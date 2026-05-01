@@ -31,6 +31,7 @@ from shared.contracts.skill import (
 )
 from shared.contracts.policy import (
     PolicyRecord,
+    PolicyType,
     PolicyScope as PolicyScopeModel,
     PolicyCondition,
     PolicyEffect,
@@ -42,6 +43,13 @@ from shared.contracts.topic import (
     ResolvedTopicContext,
 )
 from shared.contracts.job import JobRecord, JobStatus
+from shared.contracts.workflow import (
+    WorkflowRecord,
+    WorkflowScope,
+    WorkflowStep,
+    WorkflowStepFallback,
+    WorkflowTrigger,
+)
 from shared.db import get_engine
 from shared.settings import settings
 
@@ -124,6 +132,47 @@ class ExecutionManager:
 
         return matched
 
+    # --- Workflow registry ---
+
+    def list_workflows(self) -> list[WorkflowRecord]:
+        engine = get_engine()
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT * FROM workflows WHERE status = 'active' ORDER BY name")
+            ).mappings().fetchall()
+        return [self._row_to_workflow(r) for r in rows]
+
+    def get_workflows_for_context(
+        self,
+        user_message: str | None = None,
+        topic_profile_ids: list[str] | None = None,
+        active_workflow_ids: list[str] | None = None,
+    ) -> list[WorkflowRecord]:
+        all_workflows = self.list_workflows()
+        matched: list[WorkflowRecord] = []
+        msg_lower = user_message.lower() if user_message else ""
+        allowed_workflow_ids = set(active_workflow_ids or [])
+
+        for workflow in all_workflows:
+            trigger = workflow.triggers
+
+            if allowed_workflow_ids and workflow.id not in allowed_workflow_ids:
+                continue
+
+            if trigger.topic_profile_ids:
+                if not topic_profile_ids or not (set(trigger.topic_profile_ids) & set(topic_profile_ids)):
+                    continue
+
+            if trigger.keywords:
+                if not user_message:
+                    continue
+                if not any(keyword.lower() in msg_lower for keyword in trigger.keywords):
+                    continue
+
+            matched.append(workflow)
+
+        return matched
+
     # --- Policy registry ---
 
     def list_policies(self) -> list[PolicyRecord]:
@@ -139,12 +188,21 @@ class ExecutionManager:
         tool_name: str | None = None,
         connection_type: str | None = None,
         topic_profile_ids: list[str] | None = None,
+        active_policy_ids: list[str] | None = None,
     ) -> list[PolicyRecord]:
         """Return policies matching the execution context, ordered by priority."""
         all_policies = self.list_policies()
         matched: list[PolicyRecord] = []
+        explicit_policy_ids = set(active_policy_ids or [])
 
         for policy in all_policies:
+            if policy.type == PolicyType.WORKFLOW_PREFERENCE and policy.id not in explicit_policy_ids:
+                continue
+
+            if policy.id in explicit_policy_ids:
+                matched.append(policy)
+                continue
+
             # If policy has topic_profile_ids in scope, only match when those profiles are active
             if policy.scope.topic_profile_ids:
                 if not topic_profile_ids or not (set(policy.scope.topic_profile_ids) & set(topic_profile_ids)):
@@ -176,6 +234,7 @@ class ExecutionManager:
         tool_name: str | None = None,
         connection_type: str | None = None,
         topic_profile_ids: list[str] | None = None,
+        active_policy_ids: list[str] | None = None,
         estimated_row_count: int | None = None,
         query_analysis: dict | None = None,
     ) -> PolicyEvaluation:
@@ -184,6 +243,7 @@ class ExecutionManager:
             tool_name=tool_name,
             connection_type=connection_type,
             topic_profile_ids=topic_profile_ids,
+            active_policy_ids=active_policy_ids,
         )
 
         evaluation = PolicyEvaluation()
@@ -309,6 +369,7 @@ class ExecutionManager:
         conn_names: set[str] = set()
         runtime_types: set[str] = set()
         skill_ids: set[str] = set()
+        workflow_ids: set[str] = set()
         policy_ids: set[str] = set()
 
         for profile in active_profiles:
@@ -316,6 +377,7 @@ class ExecutionManager:
             conn_names.update(profile.allowed_connection_names)
             runtime_types.update(profile.allowed_runtime_types)
             skill_ids.update(profile.active_skill_ids)
+            workflow_ids.update(profile.active_workflow_ids)
             policy_ids.update(profile.active_policy_ids)
 
         return ResolvedTopicContext(
@@ -324,6 +386,7 @@ class ExecutionManager:
             allowed_connection_names=sorted(conn_names),
             allowed_runtime_types=sorted(runtime_types),
             active_skill_ids=sorted(skill_ids),
+            active_workflow_ids=sorted(workflow_ids),
             active_policy_ids=sorted(policy_ids),
         )
 
@@ -482,9 +545,11 @@ class ExecutionManager:
 
         # Resolve topic context for policy evaluation
         topic_profile_ids = None
+        active_policy_ids = set(req.active_policy_ids)
         if req.user_id:
             topic_ctx = self.resolve_topic_context(req.user_id)
             topic_profile_ids = [p.id for p in topic_ctx.profiles]
+            active_policy_ids.update(topic_ctx.active_policy_ids)
 
         # Resolve connection type for policy matching
         connection_type = None
@@ -508,6 +573,7 @@ class ExecutionManager:
             tool_name=tool_name,
             connection_type=connection_type,
             topic_profile_ids=topic_profile_ids,
+            active_policy_ids=sorted(active_policy_ids),
             estimated_row_count=estimated_row_count,
             query_analysis=query_analysis,
         )
@@ -1023,9 +1089,52 @@ class ExecutionManager:
             allowed_connection_names=_parse_json_list(row.get("allowed_connection_names")),
             allowed_runtime_types=_parse_json_list(row.get("allowed_runtime_types")),
             active_skill_ids=_parse_json_list(row.get("active_skill_ids")),
+            active_workflow_ids=_parse_json_list(row.get("active_workflow_ids")),
             active_policy_ids=_parse_json_list(row.get("active_policy_ids")),
             domains=_parse_json_list(row.get("domains")),
             tags=_parse_json_list(row.get("tags")),
+            created_at=row.get("created_at"),
+            updated_at=row.get("updated_at"),
+        )
+
+    def _row_to_workflow(self, row) -> WorkflowRecord:
+        def _parse_json_object(raw) -> dict:
+            if raw is None:
+                return {}
+            return json.loads(raw) if isinstance(raw, str) else raw
+
+        def _parse_json_list(raw) -> list:
+            if raw is None:
+                return []
+            return json.loads(raw) if isinstance(raw, str) else raw
+
+        triggers = _parse_json_object(row.get("triggers"))
+        steps = _parse_json_list(row.get("steps"))
+        scope = _parse_json_object(row.get("scope"))
+
+        workflow_steps = []
+        for step in steps:
+            step_dict = dict(step)
+            fallback = step_dict.get("fallback")
+            if fallback:
+                step_dict["fallback"] = WorkflowStepFallback(**fallback)
+            workflow_steps.append(WorkflowStep(**step_dict))
+
+        return WorkflowRecord(
+            id=str(row["id"]),
+            name=row["name"],
+            version=row.get("version") or "1.0.0",
+            status=row["status"],
+            title=row.get("title"),
+            description=row.get("description"),
+            triggers=WorkflowTrigger(**triggers),
+            steps=workflow_steps,
+            required_skill_ids=_parse_json_list(row.get("required_skill_ids")),
+            active_policy_ids=_parse_json_list(row.get("active_policy_ids")),
+            output_expectations=_parse_json_list(row.get("output_expectations")),
+            scope=WorkflowScope(**scope) if scope else WorkflowScope(),
+            tags=_parse_json_list(row.get("tags")),
+            metadata=_parse_json_object(row.get("metadata")),
             created_at=row.get("created_at"),
             updated_at=row.get("updated_at"),
         )

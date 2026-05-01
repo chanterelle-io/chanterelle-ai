@@ -18,6 +18,7 @@ class TopicProfile(BaseModel):
     allowed_runtime_types: list[str] = []
 
     active_skill_ids: list[str] = []
+    active_workflow_ids: list[str] = []
     active_policy_ids: list[str] = []
 
     domains: list[str] = []
@@ -44,4 +45,5 @@ class ResolvedTopicContext(BaseModel):
     allowed_connection_names: list[str] = []
     allowed_runtime_types: list[str] = []
     active_skill_ids: list[str] = []
+    active_workflow_ids: list[str] = []
     active_policy_ids: list[str] = []

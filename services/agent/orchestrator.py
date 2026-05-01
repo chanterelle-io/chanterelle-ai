@@ -31,6 +31,7 @@ from shared.contracts.execution import (
 )
 from shared.contracts.skill import SkillRecord
 from shared.contracts.topic import ResolvedTopicContext
+from shared.contracts.workflow import WorkflowRecord
 from shared.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -64,6 +65,8 @@ class Orchestrator:
 
         connection_names = [c.name for c in connections]
         skills = await self._fetch_skills(connection_names, user_message)
+        workflows = await self._fetch_workflows(user_message, topic_context)
+        active_policy_ids = self._collect_active_policy_ids(workflows, topic_context)
 
         # Filter skills by topic profile
         if topic_context and topic_context.active_skill_ids:
@@ -92,6 +95,7 @@ class Orchestrator:
             artifacts,
             tools,
             skills,
+            workflows,
             topic_context,
         )
 
@@ -123,7 +127,12 @@ class Orchestrator:
             stop_after_tool_result = False
             final_tool_message: str | None = None
             for tc in response.tool_calls:
-                result_text, artifact_id, should_stop = await self._execute_tool(session, tc, user_id=user_id)
+                result_text, artifact_id, should_stop = await self._execute_tool(
+                    session,
+                    tc,
+                    user_id=user_id,
+                    active_policy_ids=active_policy_ids,
+                )
                 tool_results.append(ToolResult(tool_call_id=tc.id, content=result_text))
                 if artifact_id:
                     new_artifact_ids.append(artifact_id)
@@ -166,12 +175,26 @@ class Orchestrator:
     # --- Tool execution ---
 
     async def _execute_tool(
-        self, session: Session, tool_call: ToolCall, user_id: str | None = None,
+        self,
+        session: Session,
+        tool_call: ToolCall,
+        user_id: str | None = None,
+        active_policy_ids: list[str] | None = None,
     ) -> tuple[str, str | None, bool]:
         if tool_call.name == "query_sql_source":
-            return await self._execute_sql_query(session, tool_call.input, user_id=user_id)
+            return await self._execute_sql_query(
+                session,
+                tool_call.input,
+                user_id=user_id,
+                active_policy_ids=active_policy_ids,
+            )
         if tool_call.name == "transform_with_python":
-            return await self._execute_python_transform(session, tool_call.input, user_id=user_id)
+            return await self._execute_python_transform(
+                session,
+                tool_call.input,
+                user_id=user_id,
+                active_policy_ids=active_policy_ids,
+            )
         if tool_call.name == "inspect_artifact":
             return await self._execute_inspect_artifact(session, tool_call.input)
         if tool_call.name == "pin_artifact":
@@ -183,7 +206,11 @@ class Orchestrator:
         return f"Unknown tool: {tool_call.name}", None, False
 
     async def _execute_sql_query(
-        self, session: Session, tool_input: dict, user_id: str | None = None,
+        self,
+        session: Session,
+        tool_input: dict,
+        user_id: str | None = None,
+        active_policy_ids: list[str] | None = None,
     ) -> tuple[str, str | None, bool]:
         connection_name = tool_input.get("connection_name", "")
         query = tool_input.get("query", "")
@@ -197,6 +224,7 @@ class Orchestrator:
         exec_request = ExecutionRequest(
             session_id=session.id,
             user_id=user_id,
+            active_policy_ids=active_policy_ids or [],
             tool=ToolInvocation(
                 tool_name="query_sql",
                 operation="query",
@@ -238,7 +266,11 @@ class Orchestrator:
         return "Query executed but no artifact was produced.", None, False
 
     async def _execute_python_transform(
-        self, session: Session, tool_input: dict, user_id: str | None = None,
+        self,
+        session: Session,
+        tool_input: dict,
+        user_id: str | None = None,
+        active_policy_ids: list[str] | None = None,
     ) -> tuple[str, str | None, bool]:
         code = tool_input.get("code", "")
         input_artifact_names = tool_input.get("input_artifacts", [])
@@ -257,6 +289,7 @@ class Orchestrator:
         exec_request = ExecutionRequest(
             session_id=session.id,
             user_id=user_id,
+            active_policy_ids=active_policy_ids or [],
             tool=ToolInvocation(
                 tool_name="python_transform",
                 operation="transform",
@@ -550,6 +583,29 @@ class Orchestrator:
             logger.warning("Failed to fetch skills: %s", e)
             return []
 
+    async def _fetch_workflows(
+        self,
+        user_message: str,
+        topic_context: ResolvedTopicContext | None = None,
+    ) -> list[WorkflowRecord]:
+        try:
+            topic_profile_ids = ",".join(profile.id for profile in topic_context.profiles) if topic_context else ""
+            active_workflow_ids = ",".join(topic_context.active_workflow_ids) if topic_context else ""
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    f"{settings.execution_service_url}/workflows/resolve",
+                    params={
+                        "user_message": user_message,
+                        "topic_profile_ids": topic_profile_ids,
+                        "active_workflow_ids": active_workflow_ids,
+                    },
+                )
+                resp.raise_for_status()
+            return [WorkflowRecord(**w) for w in resp.json()]
+        except Exception as e:
+            logger.warning("Failed to fetch workflows: %s", e)
+            return []
+
     async def _fetch_topic_context(self, user_id: str) -> ResolvedTopicContext | None:
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
@@ -569,6 +625,16 @@ class Orchestrator:
             logger.warning("Failed to fetch topic context: %s", e)
             return None
 
+    def _collect_active_policy_ids(
+        self,
+        workflows: list[WorkflowRecord] | None,
+        topic_context: ResolvedTopicContext | None,
+    ) -> list[str]:
+        policy_ids: set[str] = set(topic_context.active_policy_ids if topic_context else [])
+        for workflow in workflows or []:
+            policy_ids.update(workflow.active_policy_ids)
+        return sorted(policy_ids)
+
     # --- Prompt building ---
 
     def _build_system_prompt(
@@ -577,6 +643,7 @@ class Orchestrator:
         artifacts: list[dict],
         tools: list[ToolDefinition],
         skills: list[SkillRecord] | None = None,
+        workflows: list[WorkflowRecord] | None = None,
         topic_context: ResolvedTopicContext | None = None,
     ) -> str:
         parts = [
@@ -665,6 +732,24 @@ class Orchestrator:
                     parts.append("Expected output:")
                     for exp in skill.instructions.output_expectations:
                         parts.append(f"  - {exp}")
+                parts.append("")
+
+        if workflows:
+            parts.append("")
+            parts.append("## Active workflows")
+            for workflow in workflows:
+                parts.append(f"### {workflow.title or workflow.name}")
+                if workflow.description:
+                    parts.append(workflow.description)
+                if workflow.output_expectations:
+                    parts.append("Workflow outputs:")
+                    for output in workflow.output_expectations:
+                        parts.append(f"  - {output}")
+                if workflow.steps:
+                    parts.append("Suggested workflow steps:")
+                    for step in sorted(workflow.steps, key=lambda item: item.order):
+                        tool_hint = f" [{step.preferred_tool}]" if step.preferred_tool else ""
+                        parts.append(f"  - Step {step.order}: {step.title}{tool_hint} — {step.description}")
                 parts.append("")
 
         # Topic profile context

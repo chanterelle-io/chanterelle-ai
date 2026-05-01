@@ -29,6 +29,13 @@ class ArtifactEvictionReason(str, Enum):
     SESSION_EXPIRED = "session_expired"
 
 
+class ArtifactPreservationReason(str, Enum):
+    PINNED = "pinned"
+    PERSISTENT = "persistent"
+    NO_STORED_DATA = "no_stored_data"
+    ALREADY_EVICTED = "already_evicted"
+
+
 class RetentionClass(str, Enum):
     TEMPORARY = "temporary"
     REUSABLE = "reusable"
@@ -117,6 +124,12 @@ class EvictedArtifactInfo(BaseModel):
     reason: ArtifactEvictionReason
 
 
+class PreservedArtifactInfo(BaseModel):
+    artifact_id: str
+    name: str
+    reason: ArtifactPreservationReason
+
+
 class ArtifactEvictionCandidate(BaseModel):
     artifact_id: str
     session_id: str
@@ -136,3 +149,4 @@ class ArtifactEvictionResult(BaseModel):
     used_bytes_after: int
     reclaimed_bytes: int
     evicted_artifacts: list[EvictedArtifactInfo]
+    preserved_artifacts: list[PreservedArtifactInfo] = []

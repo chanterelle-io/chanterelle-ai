@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 from sqlalchemy import text
 
+from shared.contracts.artifact import ArtifactEvictionResult, PreservedArtifactInfo
 from shared.db import get_engine
 from shared.settings import settings
 
@@ -22,6 +23,18 @@ class Session:
     created_at: datetime | None = None
     last_accessed_at: datetime | None = None
     expires_at: datetime | None = None
+
+
+@dataclass
+class SessionCleanupResult:
+    session_id: str
+    tracked_artifact_ids: list[str] = field(default_factory=list)
+    evicted_artifact_ids: list[str] = field(default_factory=list)
+    non_evicted_artifact_ids: list[str] = field(default_factory=list)
+    preserved_artifacts: list[PreservedArtifactInfo] = field(default_factory=list)
+    reclaimed_bytes: int = 0
+    deleted: bool = False
+    cleanup_error: str | None = None
 
 
 class SessionStore:
@@ -77,12 +90,13 @@ class SessionStore:
             )
             conn.commit()
 
-    def cleanup_expired_sessions(self, limit: int = 100) -> list[str]:
+    def cleanup_expired_sessions(self, limit: int = 100) -> list[SessionCleanupResult]:
         engine = get_engine()
+        cleanup_results: list[SessionCleanupResult] = []
         with engine.connect() as conn:
             rows = conn.execute(
                 text("""
-                    SELECT id FROM sessions
+                    SELECT id, artifact_ids FROM sessions
                     WHERE expires_at IS NOT NULL AND expires_at <= NOW()
                     ORDER BY expires_at
                     LIMIT :limit
@@ -90,17 +104,42 @@ class SessionStore:
                 {"limit": limit},
             ).mappings().fetchall()
 
-            session_ids = [row["id"] for row in rows]
-            if session_ids:
-                for session_id in session_ids:
-                    self._cleanup_session_artifacts(session_id)
+            if rows:
+                for row in rows:
+                    session_id = row["id"]
+                    tracked_artifact_ids = self._decode_json_list(row.get("artifact_ids"))
+                    cleanup_result = SessionCleanupResult(
+                        session_id=session_id,
+                        tracked_artifact_ids=tracked_artifact_ids,
+                        non_evicted_artifact_ids=list(tracked_artifact_ids),
+                    )
+
+                    artifact_cleanup = self._cleanup_session_artifacts(session_id, strict=True)
+                    if artifact_cleanup is None:
+                        cleanup_result.cleanup_error = "Artifact cleanup did not return a result"
+                        cleanup_results.append(cleanup_result)
+                        continue
+
+                    cleanup_result.evicted_artifact_ids = [
+                        item.artifact_id for item in artifact_cleanup.evicted_artifacts
+                    ]
+                    cleanup_result.non_evicted_artifact_ids = [
+                        artifact_id
+                        for artifact_id in tracked_artifact_ids
+                        if artifact_id not in set(cleanup_result.evicted_artifact_ids)
+                    ]
+                    cleanup_result.preserved_artifacts = artifact_cleanup.preserved_artifacts
+                    cleanup_result.reclaimed_bytes = artifact_cleanup.reclaimed_bytes
+
                     conn.execute(
                         text("DELETE FROM sessions WHERE id = :id"),
                         {"id": session_id},
                     )
+                    cleanup_result.deleted = True
+                    cleanup_results.append(cleanup_result)
                 conn.commit()
 
-        return session_ids
+        return cleanup_results
 
     def expire(self, session_id: str) -> Session | None:
         engine = get_engine()
@@ -133,7 +172,11 @@ class SessionStore:
             conn.execute(text("DELETE FROM sessions WHERE id = :id"), {"id": session_id})
             conn.commit()
 
-    def _cleanup_session_artifacts(self, session_id: str) -> None:
+    def _cleanup_session_artifacts(
+        self,
+        session_id: str,
+        strict: bool = False,
+    ) -> ArtifactEvictionResult | None:
         try:
             with httpx.Client(timeout=10.0) as client:
                 resp = client.post(
@@ -141,12 +184,16 @@ class SessionStore:
                     params={"session_id": session_id},
                 )
                 resp.raise_for_status()
+                return ArtifactEvictionResult.model_validate(resp.json())
         except Exception as exc:
             logger.warning(
                 "Failed to clean up artifacts for expired session %s: %s",
                 session_id,
                 exc,
             )
+            if strict:
+                raise
+        return None
 
     def _fetch_row(self, session_id: str):
         engine = get_engine()
@@ -205,8 +252,7 @@ class SessionStore:
     def _row_to_session(self, row) -> Session:
         messages_raw = row["messages"]
         messages = json.loads(messages_raw) if isinstance(messages_raw, str) else messages_raw
-        artifacts_raw = row["artifact_ids"]
-        artifact_ids = json.loads(artifacts_raw) if isinstance(artifacts_raw, str) else artifacts_raw
+        artifact_ids = self._decode_json_list(row.get("artifact_ids"))
         return Session(
             id=row["id"],
             messages=messages,
@@ -215,6 +261,14 @@ class SessionStore:
             last_accessed_at=row.get("last_accessed_at"),
             expires_at=row.get("expires_at"),
         )
+
+    def _decode_json_list(self, raw_value) -> list[str]:
+        if raw_value is None:
+            return []
+        decoded = json.loads(raw_value) if isinstance(raw_value, str) else raw_value
+        if not decoded:
+            return []
+        return list(decoded)
 
     def _is_expired(self, row) -> bool:
         expires_at = row.get("expires_at")

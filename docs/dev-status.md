@@ -1,9 +1,9 @@
 # Development Status
 
-## Current Phase: Phase 6 — Retention + Previews + Polish
-Status: **In progress — artifact previews started**
+## Current Phase: Phase 7 — Workflow Definitions + Advanced Skills
+Status: **In progress — workflow registry, topic-aware activation, and workflow-aware policy enforcement implemented**
 
-Phase 5 is complete and tested end-to-end. Phase 6 work has begun with cached artifact previews in the Artifact Service and agent-side reuse of those previews during inspection.
+Phase 6 retention, previews, and cleanup behavior are implemented and validated end-to-end. Phase 7 now includes a workflow registry, seeded workflow definitions, prompt-level workflow activation in the agent, topic-profile workflow allowlists for user-scoped activation, and workflow-activated policy enforcement in execution.
 
 ## Phase 1 — Core Loop ✓
 Status: **Complete — tested end-to-end**
@@ -61,9 +61,8 @@ Status: **Complete — tested end-to-end**
 #### Seed Data
 - [x] `scripts/seed.py` — creates `data/sample.db` (customers, orders, products) + registers `sample_db` connection + registers runtimes + seeds skills
 
-### Not Built Yet (Phase 6+)
-- [ ] Retention + eviction
-- [ ] Workflow definitions
+### Not Built Yet (Phase 7+)
+- [ ] Workflow-aware runtime preferences beyond current deny/allow policy activation
 
 ### Known Limitations
 - Python runtime uses `exec()` with restricted builtins but no full sandbox
@@ -103,7 +102,55 @@ Status: **Complete — tested end-to-end**
 - [x] Agent can now answer follow-up questions about data values without re-querying
 
 #### Seed Data
-- [x] `scripts/seed.py` — seeds two skills: `sample_db_connector` (connector) and `churn_analysis` (metric)
+- [x] `scripts/seed.py` — seeds three skills: `sample_db_connector` (connector), `churn_analysis` (metric), and `revenue_analysis` (metric)
+
+## Phase 7 — Workflow Definitions + Advanced Skills
+Status: **Expanded implementation — live resolve path, topic-aware activation, and workflow policy enforcement validated**
+
+### What's Built
+
+#### DB Schema
+- [x] `workflows` table in `db/init.sql` (id, name, version, status, title, description, triggers, steps, required_skill_ids, active_policy_ids, output_expectations, scope, tags, metadata)
+- [x] `scripts/migrate_phase7.py` — migration for existing DBs
+- [x] `scripts/migrate_phase8.py` — add `active_workflow_ids` to topic profiles for workflow allowlists
+- [x] `Makefile` — added `make migrate-phase7`
+- [x] `Makefile` — added `make migrate-phase8`
+
+#### Shared Contracts
+- [x] `shared/contracts/workflow.py` — WorkflowRecord, WorkflowTrigger, WorkflowScope, WorkflowStep, WorkflowStepFallback, WorkflowStatus
+
+#### Workflow Registry (Execution Service)
+- [x] `manager.py` — `list_workflows()` and `get_workflows_for_context()` with keyword-triggered matching and optional workflow allowlists
+- [x] `app.py` — `GET /workflows` and `GET /workflows/resolve?user_message=&topic_profile_ids=&active_workflow_ids=`
+
+#### Workflow-Aware Policy Enforcement
+- [x] `shared/contracts/execution.py` — added `active_policy_ids` to `ExecutionRequest`
+- [x] `orchestrator.py` — merges topic and matched-workflow policy ids into execution requests
+- [x] `manager.py` — activates `workflow_preference` policies only when explicitly referenced by the request or topic context
+- [x] `scripts/seed.py` — seeds `deny_python_for_revenue_workflow` and links it to `revenue_breakdown`
+
+#### Workflow Activation (Agent)
+- [x] `orchestrator.py` — fetches workflows via `/workflows/resolve`
+- [x] `orchestrator.py` — passes active topic-profile workflow ids into workflow resolution
+- [x] `orchestrator.py` — injects workflow descriptions, ordered steps, and output expectations into the system prompt
+
+#### Topic-Profile Workflow Activation
+- [x] `shared/contracts/topic.py` — added `active_workflow_ids` to topic profiles and resolved topic context
+- [x] `scripts/seed.py` — finance profile activates only `revenue_breakdown`; general exploration activates both seeded workflows
+- [x] `manager.py` — resolved topic context now merges active workflow ids across active profiles
+
+#### Advanced Skill Expansion
+- [x] `scripts/seed.py` — added `revenue_analysis` metric skill
+
+#### Seed Data
+- [x] `scripts/seed.py` — seeds two workflows: `churn_investigation` and `revenue_breakdown`
+
+#### Live Validation
+- [x] `GET /workflows` returned the seeded active workflows
+- [x] `GET /workflows/resolve` matched `churn_investigation` for churn prompts
+- [x] `GET /workflows/resolve` matched `revenue_breakdown` for revenue prompts
+- [x] `finance-user` resolved only `revenue_breakdown`, while `analyst-user` resolved both revenue and churn workflows
+- [x] Direct `POST /execute` validation: the same `python_transform` request succeeded with no workflow policy ids and was denied when the revenue workflow's active policy ids were supplied
 
 ## Phase 4 — Policies + Topic Profiles + Execution Routing ✓
 Status: **Complete — tested end-to-end**
@@ -225,7 +272,7 @@ Status: **In progress — retention, previews, and session cleanup foundation im
 
 ### Next Up in Phase 6
 - [ ] Eviction policy tuning and richer cleanup reasoning
-- [ ] End-to-end runtime validation of quota-triggered eviction behavior
+- [x] End-to-end runtime validation of quota-triggered eviction behavior
 - [x] End-to-end runtime validation of session-expiration cleanup behavior
 - [x] Session lifecycle cleanup and expiration foundation
 
@@ -235,13 +282,17 @@ Status: **In progress — retention, previews, and session cleanup foundation im
 - [x] `services/agent/session.py` — refreshes session expiry on use, resets expired sessions on reuse, and exposes expired-session cleanup
 - [x] `services/agent/app.py` — added `GET /sessions/{session_id}` and `POST /sessions/cleanup`
 - [x] `services/agent/session.py` + `services/artifact/app.py` — expired-session cleanup now coordinates with the Artifact Service so eligible artifacts are evicted with reason `session_expired` before the session row is deleted
+- [x] `services/agent/session.py` + `services/agent/app.py` — cleanup responses now include per-session tracked and evicted artifact ids plus `preserved_artifacts` reasons, and the admin cleanup pass skips session deletion if strict artifact cleanup fails
+- [x] `services/artifact/app.py` — quota eviction responses now include `preserved_artifacts`, making pinned-only over-quota sessions explainable instead of opaque
+- [x] Live validation — quota-triggered eviction evicts eligible artifacts with `quota_pressure` and returns the session to a non-over-quota state
+- [x] Live validation — pinned-only over-quota sessions now return `preserved_artifacts` with reason `pinned` and can remain over quota with `evictable_bytes = 0`
 - [x] Live validation — forced session expiration plus cleanup evicts unpinned artifacts with `session_expired` and preserves pinned artifacts
+- [x] Live validation — session cleanup now returns per-session evicted artifacts plus preserved artifact reasons such as `pinned` in the admin response
 
-### Remaining Phase 6 Work
-- [ ] End-to-end runtime validation of quota-triggered eviction behavior
-- [ ] Cleanup policy tuning and operator-facing validation around pinned vs unpinned artifacts during session expiration
-
-## Sample Data Source
+### Remaining Phase 7 Work
+- [ ] Topic-profile-aware workflow activation and restriction
+- [ ] Workflow-aware policy/routing behavior beyond prompt guidance
+- [ ] Deeper workflow validation through live `/chat` behavior
 - SQLite at `data/sample.db`
 - 200 customers, ~1200 orders, 5 products
 - Connection name: `sample_db`

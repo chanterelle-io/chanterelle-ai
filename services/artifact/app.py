@@ -150,6 +150,10 @@ def _evict_to_quota(session_id: str) -> ArtifactEvictionResult:
     candidates = catalog.list_eviction_candidates(session_id=session_id, limit=500)
 
     if not candidates:
+        preserved_artifacts = catalog.list_session_preserved_artifacts(
+            session_id,
+            evicted_artifact_ids=set(),
+        )
         return ArtifactEvictionResult(
             session_id=session_id,
             quota_bytes=quota_bytes,
@@ -157,6 +161,7 @@ def _evict_to_quota(session_id: str) -> ArtifactEvictionResult:
             used_bytes_after=used_bytes_before,
             reclaimed_bytes=0,
             evicted_artifacts=[],
+            preserved_artifacts=preserved_artifacts,
         )
 
     for candidate in candidates:
@@ -177,11 +182,17 @@ def _evict_to_quota(session_id: str) -> ArtifactEvictionResult:
         if evicted is not None:
             evicted_artifacts.append(evicted)
 
+    preserved_artifacts = catalog.list_session_preserved_artifacts(
+        session_id,
+        evicted_artifact_ids={artifact.artifact_id for artifact in evicted_artifacts},
+    )
+
     return catalog.build_eviction_result(
         session_id=session_id,
         quota_bytes=quota_bytes,
         used_bytes_before=used_bytes_before,
         evicted_artifacts=evicted_artifacts,
+        preserved_artifacts=preserved_artifacts,
     )
 
 
@@ -205,9 +216,15 @@ def _evict_for_session_cleanup(session_id: str) -> ArtifactEvictionResult:
         if evicted is not None:
             evicted_artifacts.append(evicted)
 
+    preserved_artifacts = catalog.list_session_preserved_artifacts(
+        session_id,
+        evicted_artifact_ids={artifact.artifact_id for artifact in evicted_artifacts},
+    )
+
     return catalog.build_eviction_result(
         session_id=session_id,
         quota_bytes=quota_bytes,
         used_bytes_before=used_bytes_before,
         evicted_artifacts=evicted_artifacts,
+        preserved_artifacts=preserved_artifacts,
     )

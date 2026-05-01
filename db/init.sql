@@ -80,6 +80,28 @@ CREATE TABLE IF NOT EXISTS skills (
 
 CREATE INDEX IF NOT EXISTS idx_skills_category ON skills(category);
 
+-- Phase 3/4: Workflows
+CREATE TABLE IF NOT EXISTS workflows (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name VARCHAR(255) NOT NULL UNIQUE,
+    version VARCHAR(50) NOT NULL DEFAULT '1.0.0',
+    status VARCHAR(50) NOT NULL DEFAULT 'active',
+    title VARCHAR(255),
+    description TEXT,
+    triggers JSONB NOT NULL DEFAULT '{}',
+    steps JSONB NOT NULL DEFAULT '[]',
+    required_skill_ids JSONB NOT NULL DEFAULT '[]',
+    active_policy_ids JSONB NOT NULL DEFAULT '[]',
+    output_expectations JSONB NOT NULL DEFAULT '[]',
+    scope JSONB NOT NULL DEFAULT '{}',
+    tags JSONB NOT NULL DEFAULT '[]',
+    metadata JSONB NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_workflows_status ON workflows(status);
+
 -- Phase 3: Credential store
 ALTER TABLE connections ADD COLUMN IF NOT EXISTS auth_method VARCHAR(50);
 ALTER TABLE connections ADD COLUMN IF NOT EXISTS auth_config JSONB NOT NULL DEFAULT '{}';
@@ -114,6 +136,7 @@ CREATE TABLE IF NOT EXISTS topic_profiles (
     allowed_connection_names JSONB NOT NULL DEFAULT '[]',
     allowed_runtime_types JSONB NOT NULL DEFAULT '[]',
     active_skill_ids JSONB NOT NULL DEFAULT '[]',
+    active_workflow_ids JSONB NOT NULL DEFAULT '[]',
     active_policy_ids JSONB NOT NULL DEFAULT '[]',
     domains JSONB NOT NULL DEFAULT '[]',
     tags JSONB NOT NULL DEFAULT '[]',

@@ -2,8 +2,9 @@ import logging
 from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
+from shared.contracts.artifact import PreservedArtifactInfo
 from services.agent.llm.claude import ClaudeProvider
 from services.agent.orchestrator import Orchestrator
 from services.agent.session import SessionStore
@@ -40,6 +41,24 @@ class SessionResponse(BaseModel):
 
 class SessionCleanupResponse(BaseModel):
     deleted_session_ids: list[str]
+    deleted_sessions: list["DeletedSessionCleanupResponse"] = Field(default_factory=list)
+    skipped_session_ids: list[str] = Field(default_factory=list)
+    skipped_sessions: list["SkippedSessionCleanupResponse"] = Field(default_factory=list)
+
+
+class DeletedSessionCleanupResponse(BaseModel):
+    session_id: str
+    tracked_artifact_ids: list[str] = Field(default_factory=list)
+    evicted_artifact_ids: list[str] = Field(default_factory=list)
+    non_evicted_artifact_ids: list[str] = Field(default_factory=list)
+    preserved_artifacts: list[PreservedArtifactInfo] = Field(default_factory=list)
+    reclaimed_bytes: int = 0
+
+
+class SkippedSessionCleanupResponse(BaseModel):
+    session_id: str
+    tracked_artifact_ids: list[str] = Field(default_factory=list)
+    cleanup_error: str
 
 
 class SessionExpireResponse(BaseModel):
@@ -79,8 +98,34 @@ def get_session(session_id: str) -> SessionResponse:
 
 @app.post("/sessions/cleanup", response_model=SessionCleanupResponse)
 def cleanup_sessions(limit: int = Query(default=100, ge=1, le=1000)) -> SessionCleanupResponse:
-    deleted_session_ids = sessions.cleanup_expired_sessions(limit=limit)
-    return SessionCleanupResponse(deleted_session_ids=deleted_session_ids)
+    cleanup_results = sessions.cleanup_expired_sessions(limit=limit)
+    deleted_sessions = [
+        DeletedSessionCleanupResponse(
+            session_id=result.session_id,
+            tracked_artifact_ids=result.tracked_artifact_ids,
+            evicted_artifact_ids=result.evicted_artifact_ids,
+            non_evicted_artifact_ids=result.non_evicted_artifact_ids,
+            preserved_artifacts=result.preserved_artifacts,
+            reclaimed_bytes=result.reclaimed_bytes,
+        )
+        for result in cleanup_results
+        if result.deleted
+    ]
+    skipped_sessions = [
+        SkippedSessionCleanupResponse(
+            session_id=result.session_id,
+            tracked_artifact_ids=result.tracked_artifact_ids,
+            cleanup_error=result.cleanup_error or "Artifact cleanup failed",
+        )
+        for result in cleanup_results
+        if not result.deleted
+    ]
+    return SessionCleanupResponse(
+        deleted_session_ids=[result.session_id for result in cleanup_results if result.deleted],
+        deleted_sessions=deleted_sessions,
+        skipped_session_ids=[result.session_id for result in cleanup_results if not result.deleted],
+        skipped_sessions=skipped_sessions,
+    )
 
 
 @app.post("/sessions/{session_id}/expire", response_model=SessionExpireResponse)
