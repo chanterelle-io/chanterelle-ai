@@ -323,9 +323,11 @@ Recommended implementation order:
 
 ---
 
-## Phase 7 — Workflow Definitions + Advanced Skills + Multi-Scope Governance
+## Phase 7 — Post-MVP: Workflow Definitions + Advanced Skills + Multi-Scope Governance
 
-**Goal:** The system supports structured multi-step workflows, richer skill scopes, and organization-level governance.
+**Goal:** Extend the MVP with structured multi-step workflows, richer skill scopes, and organization-level governance.
+
+**MVP boundary:** This phase is explicitly beyond MVP. The MVP cut line is Phase 6. For MVP, use skill `recommendedSteps` guidance instead of a separate workflow registry.
 
 ### 7.1 Workflow Registry
 
@@ -358,6 +360,7 @@ These are from the architecture spec but explicitly deferred beyond MVP:
 - **Managed-table promotion** (Delta/Iceberg) — add when datasets need incremental updates or production sharing
 - **Distributed big-data runtimes** (Spark) — add when interactive runtimes can't handle the workload
 - **Rich audit and compliance** — start with turn-level topic activation logs, expand later
+- **Workflow definitions as a separate registry** — for MVP, use skill `recommendedSteps`; add workflow entities only after the core product loop is stable
 - **Dynamic topic switching mid-session** — start with per-session topic, upgrade later
 - **Multiple workspace/organization support** — start single-tenant
 

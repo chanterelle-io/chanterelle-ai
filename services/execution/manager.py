@@ -257,6 +257,8 @@ class ExecutionManager:
 
             if effect.denied_tool_names:
                 evaluation.denied_tools.extend(effect.denied_tool_names)
+            if effect.required_skill_ids:
+                evaluation.required_skill_ids.extend(effect.required_skill_ids)
             if effect.required_tool_names:
                 evaluation.required_tools.extend(effect.required_tool_names)
             if effect.denied_runtime_types:
@@ -272,6 +274,7 @@ class ExecutionManager:
 
         # Deduplicate
         evaluation.denied_tools = list(set(evaluation.denied_tools))
+        evaluation.required_skill_ids = list(set(evaluation.required_skill_ids))
         evaluation.required_tools = list(set(evaluation.required_tools))
         evaluation.denied_runtimes = list(set(evaluation.denied_runtimes))
 
@@ -542,9 +545,12 @@ class ExecutionManager:
     async def execute(self, req: ExecutionRequest) -> ExecutionResult:
         tool_name = req.tool.tool_name
         runtime_type = TOOL_RUNTIME_MAP.get(tool_name)
+        preferred_tool_names = set(req.preferred_tool_names)
 
         # Resolve topic context for policy evaluation
         topic_profile_ids = None
+        active_skill_ids = set(req.active_skill_ids)
+        required_skill_ids = set(req.required_skill_ids)
         active_policy_ids = set(req.active_policy_ids)
         if req.user_id:
             topic_ctx = self.resolve_topic_context(req.user_id)
@@ -577,11 +583,35 @@ class ExecutionManager:
             estimated_row_count=estimated_row_count,
             query_analysis=query_analysis,
         )
+        required_skill_ids.update(evaluation.required_skill_ids)
 
         if evaluation.matched_policies:
             logger.info(
                 "Policy evaluation for %s: %d policies matched",
                 tool_name, len(evaluation.matched_policies),
+            )
+
+        missing_skill_ids = sorted(required_skill_ids - active_skill_ids)
+        if missing_skill_ids:
+            return ExecutionResult(
+                execution_id=req.id,
+                status="denied",
+                error_message=(
+                    "Execution requires active skills that are not present in this turn: "
+                    + ", ".join(missing_skill_ids)
+                ),
+                policy_evaluation=evaluation.model_dump(),
+            )
+
+        if preferred_tool_names and tool_name not in preferred_tool_names:
+            return ExecutionResult(
+                execution_id=req.id,
+                status="denied",
+                error_message=(
+                    "Tool '" + tool_name + "' does not satisfy preferred tool set: "
+                    + ", ".join(sorted(preferred_tool_names))
+                ),
+                policy_evaluation=evaluation.model_dump(),
             )
 
         # Check if the tool is denied by policy
@@ -599,6 +629,17 @@ class ExecutionManager:
                 execution_id=req.id,
                 status="denied",
                 error_message=f"Runtime '{runtime_type}' is denied by policy",
+                policy_evaluation=evaluation.model_dump(),
+            )
+
+        if evaluation.preferred_runtime and runtime_type and runtime_type != evaluation.preferred_runtime:
+            return ExecutionResult(
+                execution_id=req.id,
+                status="denied",
+                error_message=(
+                    f"Runtime '{runtime_type}' does not satisfy preferred runtime "
+                    f"'{evaluation.preferred_runtime}'"
+                ),
                 policy_evaluation=evaluation.model_dump(),
             )
 

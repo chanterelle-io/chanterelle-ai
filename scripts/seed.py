@@ -492,12 +492,12 @@ def seed_policies() -> None:
             "tags": json.dumps(["performance"]),
         },
         {
-            "name": "deny_python_for_revenue_workflow",
+            "name": "prefer_sql_for_revenue_workflow",
             "type": "workflow_preference",
-            "description": "Revenue workflow stays in SQL unless a later workflow explicitly allows Python.",
+            "description": "Revenue workflow prefers SQL execution for its analysis steps.",
             "scope": json.dumps({"level": "global"}),
-            "condition": json.dumps({"tool_names": ["python_transform"]}),
-            "effect": json.dumps({"denied_tool_names": ["python_transform"]}),
+            "condition": json.dumps({}),
+            "effect": json.dumps({"preferred_runtime_type": "sql"}),
             "priority": 12,
             "tags": json.dumps(["workflow", "revenue", "sql-first"]),
         },
@@ -552,7 +552,7 @@ def seed_policies() -> None:
 
     with engine.connect() as conn:
         revenue_policy = conn.execute(
-            text("SELECT id FROM policies WHERE name = 'deny_python_for_revenue_workflow'")
+            text("SELECT id FROM policies WHERE name = 'prefer_sql_for_revenue_workflow'")
         ).fetchone()
         revenue_workflow = conn.execute(
             text("SELECT id FROM workflows WHERE name = 'revenue_breakdown'")
@@ -571,7 +571,7 @@ def seed_policies() -> None:
                 },
             )
             conn.commit()
-            print("Linked policy 'deny_python_for_revenue_workflow' to revenue_breakdown workflow")
+            print("Linked policy 'prefer_sql_for_revenue_workflow' to revenue_breakdown workflow")
 
 
 def seed_topic_profiles() -> None:

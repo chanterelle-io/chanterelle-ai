@@ -25,18 +25,45 @@ class ChatRequest(BaseModel):
     user_id: str | None = None
 
 
+class WorkflowConstraintTrace(BaseModel):
+    workflow_name: str
+    workflow_title: str | None = None
+    active_policy_ids: list[str] = Field(default_factory=list)
+    required_skill_ids: list[str] = Field(default_factory=list)
+    required_skill_names: list[str] = Field(default_factory=list)
+    preferred_tool_names: list[str] = Field(default_factory=list)
+    preferred_runtime_types: list[str] = Field(default_factory=list)
+
+
 class ChatResponse(BaseModel):
     session_id: str
     message: str
     artifact_ids: list[str] = []
+    workflow_trace: list[WorkflowConstraintTrace] = Field(default_factory=list)
+
 
 
 class SessionResponse(BaseModel):
     session_id: str
     message_count: int
+    messages: list[dict] = []
     artifact_ids: list[str]
     last_accessed_at: datetime | None = None
     expires_at: datetime | None = None
+
+
+class WorkflowSessionEvent(BaseModel):
+    message_index: int
+    role: str
+    content: str
+    workflow_trace: list[WorkflowConstraintTrace] = Field(default_factory=list)
+    workflow_denial_message: str | None = None
+
+
+class WorkflowSessionEventsResponse(BaseModel):
+    session_id: str
+    event_count: int
+    events: list[WorkflowSessionEvent] = Field(default_factory=list)
 
 
 class SessionCleanupResponse(BaseModel):
@@ -90,9 +117,39 @@ def get_session(session_id: str) -> SessionResponse:
     return SessionResponse(
         session_id=session.id,
         message_count=len(session.messages),
+        messages=session.messages,
         artifact_ids=session.artifact_ids,
         last_accessed_at=session.last_accessed_at,
         expires_at=session.expires_at,
+    )
+
+
+@app.get("/sessions/{session_id}/workflow-events", response_model=WorkflowSessionEventsResponse)
+def get_session_workflow_events(session_id: str) -> WorkflowSessionEventsResponse:
+    session = sessions.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    events: list[WorkflowSessionEvent] = []
+    for index, message in enumerate(session.messages):
+        workflow_trace = message.get("workflow_trace") or []
+        workflow_denial_message = message.get("workflow_denial_message")
+        if not workflow_trace and not workflow_denial_message:
+            continue
+        events.append(
+            WorkflowSessionEvent(
+                message_index=index,
+                role=message.get("role", "assistant"),
+                content=message.get("content", ""),
+                workflow_trace=[WorkflowConstraintTrace(**trace) for trace in workflow_trace],
+                workflow_denial_message=workflow_denial_message,
+            )
+        )
+
+    return WorkflowSessionEventsResponse(
+        session_id=session.id,
+        event_count=len(events),
+        events=events,
     )
 
 

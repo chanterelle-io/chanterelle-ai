@@ -1,9 +1,9 @@
 # Development Status
 
 ## Current Phase: Phase 7 — Workflow Definitions + Advanced Skills
-Status: **In progress — workflow registry, topic-aware activation, and workflow-aware policy enforcement implemented**
+Status: **In progress — workflow registry, topic-aware activation, workflow-aware policy enforcement, and required-skill enforcement implemented**
 
-Phase 6 retention, previews, and cleanup behavior are implemented and validated end-to-end. Phase 7 now includes a workflow registry, seeded workflow definitions, prompt-level workflow activation in the agent, topic-profile workflow allowlists for user-scoped activation, and workflow-activated policy enforcement in execution.
+Phase 6 retention, previews, and cleanup behavior are implemented and validated end-to-end. Phase 7 now includes a workflow registry, seeded workflow definitions, prompt-level workflow activation in the agent, topic-profile workflow allowlists for user-scoped activation, workflow-activated policy enforcement in execution, and required-skill enforcement for matched workflows.
 
 ## Phase 1 — Core Loop ✓
 Status: **Complete — tested end-to-end**
@@ -62,7 +62,7 @@ Status: **Complete — tested end-to-end**
 - [x] `scripts/seed.py` — creates `data/sample.db` (customers, orders, products) + registers `sample_db` connection + registers runtimes + seeds skills
 
 ### Not Built Yet (Phase 7+)
-- [ ] Workflow-aware runtime preferences beyond current deny/allow policy activation
+- [ ] Dedicated audit log storage beyond the current session-backed workflow event history
 
 ### Known Limitations
 - Python runtime uses `exec()` with restricted builtins but no full sandbox
@@ -127,7 +127,30 @@ Status: **Expanded implementation — live resolve path, topic-aware activation,
 - [x] `shared/contracts/execution.py` — added `active_policy_ids` to `ExecutionRequest`
 - [x] `orchestrator.py` — merges topic and matched-workflow policy ids into execution requests
 - [x] `manager.py` — activates `workflow_preference` policies only when explicitly referenced by the request or topic context
-- [x] `scripts/seed.py` — seeds `deny_python_for_revenue_workflow` and links it to `revenue_breakdown`
+- [x] `scripts/seed.py` — seeds `prefer_sql_for_revenue_workflow` and links it to `revenue_breakdown`
+
+#### Workflow Required-Skill Enforcement
+- [x] `shared/contracts/execution.py` — added `active_skill_ids` and `required_skill_ids` to `ExecutionRequest`
+- [x] `shared/contracts/policy.py` — `PolicyEvaluation` now exposes `required_skill_ids`
+- [x] `orchestrator.py` — passes resolved turn skill ids and matched workflow `required_skill_ids` into execution requests
+- [x] `manager.py` — denies execution when required skills for the turn are missing
+
+#### Workflow Preferred-Tool Enforcement
+- [x] `shared/contracts/execution.py` — added `preferred_tool_names` to `ExecutionRequest`
+- [x] `orchestrator.py` — normalizes matched workflow `preferred_tool` values into execution tool names
+- [x] `manager.py` — denies execution when the requested tool falls outside the matched workflow preferred tool set
+
+#### Workflow Trace in Chat Responses
+- [x] `services/agent/app.py` — `ChatResponse` now includes `workflow_trace`
+- [x] `orchestrator.py` — returns matched workflow constraint details with each `/chat` turn
+- [x] Workflow trace includes workflow name/title, active policy ids, required skill ids and names, preferred tool names, and preferred runtime types
+- [x] `orchestrator.py` — converts workflow-constraint denials into deterministic assistant-facing chat messages
+
+#### Workflow Metadata in Session History
+- [x] `services/agent/app.py` — `GET /sessions/{id}` now returns persisted `messages`
+- [x] `services/agent/app.py` — `GET /sessions/{id}/workflow-events` returns only workflow-related session events
+- [x] `orchestrator.py` — stores `workflow_trace` on user and assistant session messages
+- [x] `orchestrator.py` — stores `workflow_denial_message` on persisted assistant messages when a workflow constraint blocks execution
 
 #### Workflow Activation (Agent)
 - [x] `orchestrator.py` — fetches workflows via `/workflows/resolve`
@@ -150,7 +173,13 @@ Status: **Expanded implementation — live resolve path, topic-aware activation,
 - [x] `GET /workflows/resolve` matched `churn_investigation` for churn prompts
 - [x] `GET /workflows/resolve` matched `revenue_breakdown` for revenue prompts
 - [x] `finance-user` resolved only `revenue_breakdown`, while `analyst-user` resolved both revenue and churn workflows
-- [x] Direct `POST /execute` validation: the same `python_transform` request succeeded with no workflow policy ids and was denied when the revenue workflow's active policy ids were supplied
+- [x] Direct `POST /execute` validation: the same `python_transform` request succeeded with no workflow policy ids and was denied with `Runtime 'python' does not satisfy preferred runtime 'sql'` when the revenue workflow's active policy ids were supplied
+- [x] Direct `POST /execute` validation: the same `python_transform` request succeeded with no required skills, was denied when workflow `required_skill_ids` were present but inactive, and succeeded again when those skill ids were provided as active for the turn
+- [x] Direct `POST /execute` validation: the same `python_transform` request succeeded with no preferred tool set and was denied with `Tool 'python_transform' does not satisfy preferred tool set: query_sql` when the revenue workflow preferred tool set was supplied
+- [x] Direct `POST /chat` validation: revenue prompt returned `workflow_trace` with `revenue_breakdown`, active policy ids, required skill names, preferred tool names, and preferred runtime types
+- [x] Direct `POST /chat` validation: a revenue prompt that explicitly requested Python returned a deterministic assistant message explaining that `Revenue Breakdown Workflow` prefers `query_sql_source`, so `transform_with_python` could not be used
+- [x] Direct `POST /chat` + `GET /sessions/{id}` validation: the persisted assistant session message includes both `workflow_trace` and `workflow_denial_message`
+- [x] Direct `GET /sessions/{id}/workflow-events` validation: the filtered endpoint returned only the workflow-scoped turns with message index, trace, and denial metadata
 
 ## Phase 4 — Policies + Topic Profiles + Execution Routing ✓
 Status: **Complete — tested end-to-end**

@@ -95,6 +95,7 @@ class PolicyEvaluation(BaseModel):
     """Result of evaluating policies against a request context."""
     matched_policies: list[PolicyRecord] = []
     denied_tools: list[str] = []
+    required_skill_ids: list[str] = []
     required_tools: list[str] = []
     denied_runtimes: list[str] = []
     preferred_runtime: str | None = None

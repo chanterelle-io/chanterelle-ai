@@ -38,6 +38,16 @@ logger = logging.getLogger(__name__)
 
 MAX_TOOL_ROUNDS = 15
 
+WORKFLOW_TOOL_TO_EXECUTION_TOOL = {
+    "query_sql_source": "query_sql",
+    "transform_with_python": "python_transform",
+}
+
+EXECUTION_TOOL_TO_AGENT_TOOL = {
+    "query_sql": "query_sql_source",
+    "python_transform": "transform_with_python",
+}
+
 
 class Orchestrator:
     def __init__(self, llm: LLMProvider):
@@ -66,11 +76,17 @@ class Orchestrator:
         connection_names = [c.name for c in connections]
         skills = await self._fetch_skills(connection_names, user_message)
         workflows = await self._fetch_workflows(user_message, topic_context)
+        active_skill_ids = sorted(skill.id for skill in skills)
+        required_skill_ids = self._collect_required_skill_ids(workflows)
+        preferred_tool_names = self._collect_preferred_tool_names(workflows)
         active_policy_ids = self._collect_active_policy_ids(workflows, topic_context)
 
         # Filter skills by topic profile
         if topic_context and topic_context.active_skill_ids:
             skills = [s for s in skills if s.id in topic_context.active_skill_ids]
+            active_skill_ids = sorted(skill.id for skill in skills)
+
+        workflow_trace = self._build_workflow_trace(workflows, skills)
 
         # Build tool list, filtered by topic profile
         all_tools = [
@@ -100,7 +116,11 @@ class Orchestrator:
         )
 
         # Add user message
-        session.messages.append({"role": "user", "content": user_message})
+        session.messages.append({
+            "role": "user",
+            "content": user_message,
+            "workflow_trace": workflow_trace,
+        })
 
         # Run the tool-use loop
         messages = self._build_llm_messages(session)
@@ -111,7 +131,11 @@ class Orchestrator:
 
             if response.stop_reason == "end_turn" or not response.tool_calls:
                 # Done — record assistant response
-                session.messages.append({"role": "assistant", "content": response.text or ""})
+                session.messages.append({
+                    "role": "assistant",
+                    "content": response.text or "",
+                    "workflow_trace": workflow_trace,
+                })
                 break
 
             # Record the assistant message with tool calls (preserve provider data for round-trip)
@@ -131,7 +155,11 @@ class Orchestrator:
                     session,
                     tc,
                     user_id=user_id,
+                    active_skill_ids=active_skill_ids,
+                    required_skill_ids=required_skill_ids,
+                    preferred_tool_names=preferred_tool_names,
                     active_policy_ids=active_policy_ids,
+                    workflow_trace=workflow_trace,
                 )
                 tool_results.append(ToolResult(tool_call_id=tc.id, content=result_text))
                 if artifact_id:
@@ -146,6 +174,8 @@ class Orchestrator:
                 session.messages.append({
                     "role": "assistant",
                     "content": final_tool_message or "Execution has been deferred.",
+                    "workflow_trace": workflow_trace,
+                    "workflow_denial_message": final_tool_message if final_tool_message else None,
                 })
                 break
 
@@ -156,11 +186,13 @@ class Orchestrator:
             session.messages.append({
                 "role": "assistant",
                 "content": f"[Used tool: {response.tool_calls[0].name}]",
+                "workflow_trace": workflow_trace,
             })
         else:
             session.messages.append({
                 "role": "assistant",
                 "content": "I reached the maximum number of tool steps. Here is what I have so far.",
+                "workflow_trace": workflow_trace,
             })
 
         # Persist session state
@@ -170,6 +202,7 @@ class Orchestrator:
             "session_id": session_id,
             "message": session.messages[-1]["content"],
             "artifact_ids": new_artifact_ids,
+            "workflow_trace": workflow_trace,
         }
 
     # --- Tool execution ---
@@ -179,21 +212,33 @@ class Orchestrator:
         session: Session,
         tool_call: ToolCall,
         user_id: str | None = None,
+        active_skill_ids: list[str] | None = None,
+        required_skill_ids: list[str] | None = None,
+        preferred_tool_names: list[str] | None = None,
         active_policy_ids: list[str] | None = None,
+        workflow_trace: list[dict[str, object]] | None = None,
     ) -> tuple[str, str | None, bool]:
         if tool_call.name == "query_sql_source":
             return await self._execute_sql_query(
                 session,
                 tool_call.input,
                 user_id=user_id,
+                active_skill_ids=active_skill_ids,
+                required_skill_ids=required_skill_ids,
+                preferred_tool_names=preferred_tool_names,
                 active_policy_ids=active_policy_ids,
+                workflow_trace=workflow_trace,
             )
         if tool_call.name == "transform_with_python":
             return await self._execute_python_transform(
                 session,
                 tool_call.input,
                 user_id=user_id,
+                active_skill_ids=active_skill_ids,
+                required_skill_ids=required_skill_ids,
+                preferred_tool_names=preferred_tool_names,
                 active_policy_ids=active_policy_ids,
+                workflow_trace=workflow_trace,
             )
         if tool_call.name == "inspect_artifact":
             return await self._execute_inspect_artifact(session, tool_call.input)
@@ -210,7 +255,11 @@ class Orchestrator:
         session: Session,
         tool_input: dict,
         user_id: str | None = None,
+        active_skill_ids: list[str] | None = None,
+        required_skill_ids: list[str] | None = None,
+        preferred_tool_names: list[str] | None = None,
         active_policy_ids: list[str] | None = None,
+        workflow_trace: list[dict[str, object]] | None = None,
     ) -> tuple[str, str | None, bool]:
         connection_name = tool_input.get("connection_name", "")
         query = tool_input.get("query", "")
@@ -224,6 +273,9 @@ class Orchestrator:
         exec_request = ExecutionRequest(
             session_id=session.id,
             user_id=user_id,
+            active_skill_ids=active_skill_ids or [],
+            required_skill_ids=required_skill_ids or [],
+            preferred_tool_names=preferred_tool_names or [],
             active_policy_ids=active_policy_ids or [],
             tool=ToolInvocation(
                 tool_name="query_sql",
@@ -249,6 +301,13 @@ class Orchestrator:
         if result.status == "error":
             return f"Query failed: {result.error_message}", None, False
         if result.status == "denied":
+            denial_message = self._format_workflow_constraint_denial(
+                tool_name="query_sql",
+                result=result,
+                workflow_trace=workflow_trace,
+            )
+            if denial_message:
+                return denial_message, None, True
             return f"Query denied by policy: {result.error_message}", None, False
         if result.status == "deferred":
             return (
@@ -270,7 +329,11 @@ class Orchestrator:
         session: Session,
         tool_input: dict,
         user_id: str | None = None,
+        active_skill_ids: list[str] | None = None,
+        required_skill_ids: list[str] | None = None,
+        preferred_tool_names: list[str] | None = None,
         active_policy_ids: list[str] | None = None,
+        workflow_trace: list[dict[str, object]] | None = None,
     ) -> tuple[str, str | None, bool]:
         code = tool_input.get("code", "")
         input_artifact_names = tool_input.get("input_artifacts", [])
@@ -289,6 +352,9 @@ class Orchestrator:
         exec_request = ExecutionRequest(
             session_id=session.id,
             user_id=user_id,
+            active_skill_ids=active_skill_ids or [],
+            required_skill_ids=required_skill_ids or [],
+            preferred_tool_names=preferred_tool_names or [],
             active_policy_ids=active_policy_ids or [],
             tool=ToolInvocation(
                 tool_name="python_transform",
@@ -313,6 +379,13 @@ class Orchestrator:
         if result.status == "error":
             return f"Transform failed: {result.error_message}", None, False
         if result.status == "denied":
+            denial_message = self._format_workflow_constraint_denial(
+                tool_name="python_transform",
+                result=result,
+                workflow_trace=workflow_trace,
+            )
+            if denial_message:
+                return denial_message, None, True
             return f"Transform denied by policy: {result.error_message}", None, False
         if result.status == "deferred":
             return (
@@ -634,6 +707,147 @@ class Orchestrator:
         for workflow in workflows or []:
             policy_ids.update(workflow.active_policy_ids)
         return sorted(policy_ids)
+
+    def _collect_required_skill_ids(
+        self,
+        workflows: list[WorkflowRecord] | None,
+    ) -> list[str]:
+        skill_ids: set[str] = set()
+        for workflow in workflows or []:
+            skill_ids.update(workflow.required_skill_ids)
+        return sorted(skill_ids)
+
+    def _collect_preferred_tool_names(
+        self,
+        workflows: list[WorkflowRecord] | None,
+    ) -> list[str]:
+        preferred_tools: set[str] = set()
+        for workflow in workflows or []:
+            for step in workflow.steps:
+                if step.preferred_tool:
+                    normalized_tool = WORKFLOW_TOOL_TO_EXECUTION_TOOL.get(step.preferred_tool)
+                    if normalized_tool:
+                        preferred_tools.add(normalized_tool)
+        return sorted(preferred_tools)
+
+    def _collect_preferred_runtime_types(
+        self,
+        workflows: list[WorkflowRecord] | None,
+    ) -> list[str]:
+        preferred_runtimes: set[str] = set()
+        for workflow in workflows or []:
+            for step in workflow.steps:
+                if step.preferred_runtime_type:
+                    preferred_runtimes.add(step.preferred_runtime_type)
+        return sorted(preferred_runtimes)
+
+    def _build_workflow_trace(
+        self,
+        workflows: list[WorkflowRecord] | None,
+        skills: list[SkillRecord] | None,
+    ) -> list[dict[str, object]]:
+        skill_name_by_id = {
+            skill.id: skill.title or skill.name
+            for skill in (skills or [])
+        }
+        trace: list[dict[str, object]] = []
+        for workflow in workflows or []:
+            preferred_tool_names = sorted(
+                {
+                    normalized_tool
+                    for step in workflow.steps
+                    if step.preferred_tool
+                    for normalized_tool in [WORKFLOW_TOOL_TO_EXECUTION_TOOL.get(step.preferred_tool)]
+                    if normalized_tool
+                }
+            )
+            preferred_runtime_types = sorted(
+                {
+                    step.preferred_runtime_type
+                    for step in workflow.steps
+                    if step.preferred_runtime_type
+                }
+            )
+            trace.append(
+                {
+                    "workflow_name": workflow.name,
+                    "workflow_title": workflow.title,
+                    "active_policy_ids": workflow.active_policy_ids,
+                    "required_skill_ids": workflow.required_skill_ids,
+                    "required_skill_names": [
+                        skill_name_by_id.get(skill_id, skill_id)
+                        for skill_id in workflow.required_skill_ids
+                    ],
+                    "preferred_tool_names": preferred_tool_names,
+                    "preferred_runtime_types": preferred_runtime_types,
+                }
+            )
+        return trace
+
+    def _format_workflow_constraint_denial(
+        self,
+        tool_name: str,
+        result: ExecutionResult,
+        workflow_trace: list[dict[str, object]] | None,
+    ) -> str | None:
+        if not result.error_message or not workflow_trace:
+            return None
+
+        workflow_labels = [
+            str(item.get("workflow_title") or item.get("workflow_name"))
+            for item in workflow_trace
+        ]
+        workflow_prefix = (
+            f"I couldn't continue because the active workflow ({', '.join(workflow_labels)}) "
+            if len(workflow_labels) == 1
+            else f"I couldn't continue because the active workflows ({', '.join(workflow_labels)}) "
+        )
+
+        if "preferred tool set" in result.error_message:
+            preferred_tools = sorted(
+                {
+                    str(tool_name)
+                    for item in workflow_trace
+                    for tool_name in item.get("preferred_tool_names", [])
+                }
+            )
+            suggested_tools = ", ".join(
+                EXECUTION_TOOL_TO_AGENT_TOOL.get(tool_name, tool_name)
+                for tool_name in preferred_tools
+            )
+            current_tool = EXECUTION_TOOL_TO_AGENT_TOOL.get(tool_name, tool_name)
+            return (
+                workflow_prefix
+                + f"prefers {suggested_tools} for this turn, so I couldn't use {current_tool}."
+            )
+
+        if "preferred runtime" in result.error_message:
+            preferred_runtimes = sorted(
+                {
+                    str(runtime_type)
+                    for item in workflow_trace
+                    for runtime_type in item.get("preferred_runtime_types", [])
+                }
+            )
+            runtime_list = ", ".join(preferred_runtimes)
+            return workflow_prefix + f"requires the {runtime_list} runtime for this turn."
+
+        if "requires active skills" in result.error_message:
+            required_skill_names = sorted(
+                {
+                    str(skill_name)
+                    for item in workflow_trace
+                    for skill_name in item.get("required_skill_names", [])
+                }
+            )
+            return (
+                workflow_prefix
+                + "requires these skills to be active first: "
+                + ", ".join(required_skill_names)
+                + "."
+            )
+
+        return None
 
     # --- Prompt building ---
 

@@ -58,10 +58,18 @@ On each turn:
 6. If the LLM calls a tool (e.g. `query_sql_source`, `transform_with_python`, `inspect_artifact`, `pin_artifact`, or `unpin_artifact`), the agent executes it by calling the Execution Service or Artifact Service
 7. Feeds the tool result back to the LLM (including policy denial or deferred messages)
 8. If the execution was deferred, the agent stops the tool loop and reports the job ID to the user
-9. Returns the LLM's final response to the user
-10. Persists the updated session (messages + artifact references) to Postgres
+9. Returns the LLM's final response to the user, along with a structured `workflow_trace` describing matched workflow constraints for that turn
+10. Persists the updated session (messages + artifact references) to Postgres, including per-message workflow metadata for later inspection
 
 The LLM provider is abstracted — currently Claude, swappable to any provider by implementing the `LLMProvider` interface.
+
+The `/chat` response now includes a `workflow_trace` field when workflows match. That trace makes the turn's workflow constraints visible to the caller by listing the matched workflow names plus active policy ids, required skills, preferred tools, and preferred runtimes.
+
+That same workflow metadata is now persisted in session history. `GET /sessions/{id}` returns the stored `messages`, and assistant messages can include both `workflow_trace` and `workflow_denial_message` when a matched workflow blocked execution on that turn.
+
+For workflow-focused inspection, `GET /sessions/{id}/workflow-events` returns a filtered view of only the session messages that carry workflow metadata, including the original message index, the trace, and any deterministic denial text.
+
+When execution is blocked by a matched workflow constraint such as a preferred tool, preferred runtime, or required skills, the agent now returns a deterministic natural-language assistant message describing that constraint instead of relying on the LLM to explain the denial after the fact.
 
 **Tools available:**
 - `query_sql_source` — execute SQL against a connected data source
@@ -168,11 +176,17 @@ Workflows have:
 - **Steps** — ordered guidance with preferred tools or runtimes
 - **Output expectations** — the kinds of artifacts or summaries the workflow should produce
 
+Workflows can also declare `required_skill_ids`, which are passed into execution for turn-level enforcement. If the current turn does not carry those active skills, execution is denied before the runtime is called.
+
+Workflows can also declare preferred tools on their steps. The agent normalizes those preferred tool names into execution tool names and passes them into the execution request. If the requested tool falls outside the matched workflow preferred tool set, execution is denied before the runtime is called.
+
 Topic profiles can also carry explicit workflow allowlists. When present, the agent only resolves workflows whose ids are active for that user's topic context.
 
 Examples: "Churn Investigation Workflow" (identify the customer base, compute churn by segment, optionally refine a prior churn artifact with Python) and "Revenue Breakdown Workflow" (aggregate revenue, break down by category or period, and rank results).
 
-Workflows can also activate specific policies for execution-time enforcement. For example, the seeded revenue workflow activates a policy that denies `python_transform`, which keeps that workflow on a SQL-first path unless a different workflow explicitly permits later transformation behavior.
+Workflows can also activate specific policies for execution-time enforcement. For example, the seeded revenue workflow activates a policy that prefers the `sql` runtime. A `python_transform` request under that workflow is denied because its mapped runtime does not satisfy the workflow's preferred runtime.
+
+Execution also enforces workflow-required skills and preferred tools. The agent now passes active skill ids for the turn, required skill ids from matched workflows, and normalized preferred tool names; the execution service denies the request if a workflow-required skill is missing or if the requested tool does not match the preferred tool set.
 
 ### Policies
 
@@ -244,4 +258,4 @@ curl -s http://localhost:8000/chat \
 ## What's next
 
 See [app-specs/plan.md](app-specs/plan.md) for the full phased plan. The immediate next steps are:
-- Workflow-aware runtime preferences beyond the current workflow policy activation path
+- Dedicated audit log storage beyond the current session-backed workflow event history

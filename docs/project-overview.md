@@ -30,7 +30,13 @@ Analytics Agent Platform — session-based analytical workspace where a user int
 - Policies evaluated at execution time — can deny tools/runtimes, force deferred mode, require approval
 - Topic profiles scope what tools, connections, skills, and workflows a user can access
 - Workflow definitions can be resolved by request keywords and active topic-profile workflow ids, then injected into the agent prompt as ordered guidance and policy activation input
-- Workflow-scoped policies can now affect execution directly when a matched workflow activates them
+- Workflow-scoped policies can now affect execution directly when a matched workflow activates them, including preferred runtime enforcement
+- Workflow-required skills can now affect execution directly when a matched workflow requires them for the current turn
+- Workflow-preferred tools can now affect execution directly when a matched workflow constrains which execution tools are allowed for that turn
+- `/chat` responses now expose matched workflow constraints through `workflow_trace`
+- `/chat` responses now also surface deterministic workflow-constraint denial messages when a requested tool or runtime violates the matched workflow
+- `GET /sessions/{id}` now exposes persisted message history including workflow traces and workflow denial messages
+- `GET /sessions/{id}/workflow-events` now exposes a filtered workflow-audit view over that persisted session history
 - Deferred execution: server-side query analysis triggers background jobs for large/unbounded queries
 - Policy conditions are server-side only — agent hints are optional fallback, not the source of truth
 - Sessions persisted in Postgres (messages + artifact refs as JSONB) with expiry and cleanup metadata
