@@ -1,4 +1,4 @@
-.PHONY: infra infra-down agent execution artifact runtime-sql runtime-python seed install
+.PHONY: infra infra-down agent execution artifact runtime-sql runtime-python seed install migrate-workflow-audit smoke-mvp
 
 install:
 	pip install -e ".[dev]"
@@ -48,6 +48,9 @@ migrate-phase7:
 migrate-phase8:
 	PYTHONPATH=. python3 scripts/migrate_phase8.py
 
+migrate-workflow-audit:
+	PYTHONPATH=. python3 scripts/migrate_workflow_audit.py
+
 all-services:
 	@echo "Run each in a separate terminal:"
 	@echo "  make artifact"
@@ -55,3 +58,6 @@ all-services:
 	@echo "  make runtime-python"
 	@echo "  make execution"
 	@echo "  make agent"
+
+smoke-mvp:
+	PYTHONPATH=. python3 scripts/mvp_smoke.py

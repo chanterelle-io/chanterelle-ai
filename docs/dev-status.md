@@ -1,9 +1,9 @@
 # Development Status
 
 ## Current Phase: Phase 7 — Workflow Definitions + Advanced Skills
-Status: **In progress — workflow registry, topic-aware activation, workflow-aware policy enforcement, and required-skill enforcement implemented**
+Status: **In progress — workflow registry, topic-aware activation, workflow-aware policy enforcement, required-skill enforcement, dedicated workflow audit storage, and tool-based skill guidance implemented**
 
-Phase 6 retention, previews, and cleanup behavior are implemented and validated end-to-end. Phase 7 now includes a workflow registry, seeded workflow definitions, prompt-level workflow activation in the agent, topic-profile workflow allowlists for user-scoped activation, workflow-activated policy enforcement in execution, and required-skill enforcement for matched workflows.
+Phase 6 retention, previews, and cleanup behavior are implemented and validated end-to-end. Phase 7 now includes a workflow registry, seeded workflow definitions, prompt-level workflow activation in the agent, topic-profile workflow allowlists for user-scoped activation, workflow-activated policy enforcement in execution, required-skill enforcement for matched workflows, append-only workflow audit events, and on-demand skill guidance retrieval.
 
 ## Phase 1 — Core Loop ✓
 Status: **Complete — tested end-to-end**
@@ -62,7 +62,8 @@ Status: **Complete — tested end-to-end**
 - [x] `scripts/seed.py` — creates `data/sample.db` (customers, orders, products) + registers `sample_db` connection + registers runtimes + seeds skills
 
 ### Not Built Yet (Phase 7+)
-- [ ] Dedicated audit log storage beyond the current session-backed workflow event history
+- [ ] Advanced skill scoping beyond the current global/connection/keyword-triggered model
+- [ ] Workspace-level governance and multi-tenant groundwork
 
 ### Known Limitations
 - Python runtime uses `exec()` with restricted builtins but no full sandbox
@@ -152,6 +153,15 @@ Status: **Expanded implementation — live resolve path, topic-aware activation,
 - [x] `orchestrator.py` — stores `workflow_trace` on user and assistant session messages
 - [x] `orchestrator.py` — stores `workflow_denial_message` on persisted assistant messages when a workflow constraint blocks execution
 
+#### Dedicated Workflow Audit Storage
+- [x] `db/init.sql` — added `workflow_audit_events` table for append-only workflow event history
+- [x] `scripts/migrate_workflow_audit.py` + `Makefile` — migration target for existing DBs
+- [x] `shared/contracts/audit.py` — added `WorkflowAuditEvent`
+- [x] `services/agent/audit.py` — added `WorkflowAuditStore`
+- [x] `orchestrator.py` — writes workflow-scoped user and assistant turn events to dedicated storage
+- [x] `services/agent/app.py` — `GET /sessions/{id}/workflow-events` now reads from dedicated audit storage when available
+- [x] `services/agent/app.py` — added `GET /workflow-audit/events` for session/user-filtered audit inspection
+
 #### Workflow Activation (Agent)
 - [x] `orchestrator.py` — fetches workflows via `/workflows/resolve`
 - [x] `orchestrator.py` — passes active topic-profile workflow ids into workflow resolution
@@ -164,6 +174,12 @@ Status: **Expanded implementation — live resolve path, topic-aware activation,
 
 #### Advanced Skill Expansion
 - [x] `scripts/seed.py` — added `revenue_analysis` metric skill
+
+#### Tool-Based Skill Guidance Pull
+- [x] `services/agent/tools/skill_guidance.py` — added `get_skill_guidance` meta-tool
+- [x] `orchestrator.py` — exposes only active skill summaries in the prompt
+- [x] `orchestrator.py` — returns full skill instructions on demand for skills active in the current turn
+- [x] `orchestrator.py` — includes `get_skill_guidance` even when topic profiles restrict execution tools
 
 #### Seed Data
 - [x] `scripts/seed.py` — seeds two workflows: `churn_investigation` and `revenue_breakdown`
@@ -319,9 +335,11 @@ Status: **In progress — retention, previews, and session cleanup foundation im
 - [x] Live validation — session cleanup now returns per-session evicted artifacts plus preserved artifact reasons such as `pinned` in the admin response
 
 ### Remaining Phase 7 Work
-- [ ] Topic-profile-aware workflow activation and restriction
-- [ ] Workflow-aware policy/routing behavior beyond prompt guidance
-- [ ] Deeper workflow validation through live `/chat` behavior
+- [ ] Advanced skill scoping: workspace, domain, and session-level skill activation
+- [ ] Workspace-level governance: workspace policies and workspace-scoped topic profiles
+- [ ] Product polish beyond the MVP path: chart generation, exports, and richer natural-language artifact references
+
+### Local Seed Dataset
 - SQLite at `data/sample.db`
 - 200 customers, ~1200 orders, 5 products
 - Connection name: `sample_db`

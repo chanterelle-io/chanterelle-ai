@@ -65,9 +65,9 @@ The LLM provider is abstracted — currently Claude, swappable to any provider b
 
 The `/chat` response now includes a `workflow_trace` field when workflows match. That trace makes the turn's workflow constraints visible to the caller by listing the matched workflow names plus active policy ids, required skills, preferred tools, and preferred runtimes.
 
-That same workflow metadata is now persisted in session history. `GET /sessions/{id}` returns the stored `messages`, and assistant messages can include both `workflow_trace` and `workflow_denial_message` when a matched workflow blocked execution on that turn.
+That same workflow metadata is now persisted in session history and in dedicated append-only workflow audit storage. `GET /sessions/{id}` returns the stored `messages`, and assistant messages can include both `workflow_trace` and `workflow_denial_message` when a matched workflow blocked execution on that turn.
 
-For workflow-focused inspection, `GET /sessions/{id}/workflow-events` returns a filtered view of only the session messages that carry workflow metadata, including the original message index, the trace, and any deterministic denial text.
+For workflow-focused inspection, `GET /sessions/{id}/workflow-events` returns a filtered view of only the session messages that carry workflow metadata, including the original message index, the trace, and any deterministic denial text. New events are read from the dedicated `workflow_audit_events` store when available, and `GET /workflow-audit/events` exposes recent events filtered by session or user.
 
 When execution is blocked by a matched workflow constraint such as a preferred tool, preferred runtime, or required skills, the agent now returns a deterministic natural-language assistant message describing that constraint instead of relying on the LLM to explain the denial after the fact.
 
@@ -78,6 +78,7 @@ When execution is blocked by a matched workflow constraint such as a preferred t
 - `pin_artifact` — protect an existing artifact from automatic cleanup
 - `unpin_artifact` — remove that cleanup protection and return the artifact to normal retention handling
 - `check_job_status` — check the status of a deferred background job
+- `get_skill_guidance` — fetch detailed instructions for an active skill only when needed
 
 ### Execution Service (port 8001)
 
@@ -165,6 +166,8 @@ Skills have:
 - **Scope** — global (always active), connection-scoped (active when a specific connection is involved), or keyword-triggered
 - **Instructions** — summary, recommended steps, dos/donts, output expectations
 
+The agent prompt now includes only each active skill's name, category, title, and summary. When detailed guidance is needed, the agent calls `get_skill_guidance` for that active skill, keeping routine turns smaller while preserving detailed domain guidance for complex requests.
+
 Examples: "Sample DB Schema Guide" (connector skill — tells the agent the table structure), "Customer Churn Analysis" (metric skill — defines how to calculate churn, triggered by keywords like "churn" or "retention"), and "Revenue Analysis" (metric skill — defines how to aggregate revenue from `orders.amount`).
 
 ### Workflows
@@ -241,6 +244,14 @@ make agent          # Port 8000
 
 ## Testing
 
+For a repeatable MVP acceptance pass against the live local stack, run:
+
+```bash
+make smoke-mvp
+```
+
+The smoke suite checks the bounded `/chat` flow, direct SQL execution, Python artifact reuse, finance topic policy denial for Python, deferred job completion, and artifact pin/unpin plus quota visibility.
+
 ```bash
 # Step 1: Topic-scoped user — finance user (SQL only, no Python)
 curl -s http://localhost:8000/chat \
@@ -258,4 +269,5 @@ curl -s http://localhost:8000/chat \
 ## What's next
 
 See [app-specs/plan.md](app-specs/plan.md) for the full phased plan. The immediate next steps are:
-- Dedicated audit log storage beyond the current session-backed workflow event history
+- Advanced skill scoping beyond the current global/connection/keyword-triggered model
+- Workspace-level governance and workspace-scoped topic profiles

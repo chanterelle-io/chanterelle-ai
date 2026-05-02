@@ -5,6 +5,7 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from shared.contracts.artifact import PreservedArtifactInfo
+from services.agent.audit import WorkflowAuditStore
 from services.agent.llm.claude import ClaudeProvider
 from services.agent.orchestrator import Orchestrator
 from services.agent.session import SessionStore
@@ -17,6 +18,7 @@ app = FastAPI(title="Agent Service", version="0.1.0")
 llm = ClaudeProvider()
 orchestrator = Orchestrator(llm=llm)
 sessions = SessionStore()
+workflow_audit = WorkflowAuditStore()
 
 
 class ChatRequest(BaseModel):
@@ -53,15 +55,24 @@ class SessionResponse(BaseModel):
 
 
 class WorkflowSessionEvent(BaseModel):
+    id: str | None = None
     message_index: int
     role: str
     content: str
+    user_id: str | None = None
     workflow_trace: list[WorkflowConstraintTrace] = Field(default_factory=list)
     workflow_denial_message: str | None = None
+    artifact_ids: list[str] = Field(default_factory=list)
+    created_at: datetime | None = None
 
 
 class WorkflowSessionEventsResponse(BaseModel):
     session_id: str
+    event_count: int
+    events: list[WorkflowSessionEvent] = Field(default_factory=list)
+
+
+class WorkflowAuditEventsResponse(BaseModel):
     event_count: int
     events: list[WorkflowSessionEvent] = Field(default_factory=list)
 
@@ -130,6 +141,35 @@ def get_session_workflow_events(session_id: str) -> WorkflowSessionEventsRespons
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
+    try:
+        audit_events = workflow_audit.list_session_events(session_id)
+    except Exception as exc:
+        logger.warning("Failed to read workflow audit events for session %s: %s", session_id, exc)
+        audit_events = []
+
+    if audit_events:
+        events = [
+            WorkflowSessionEvent(
+                id=event.id,
+                message_index=event.message_index or 0,
+                role=event.role,
+                content=event.content,
+                user_id=event.user_id,
+                workflow_trace=[
+                    WorkflowConstraintTrace(**trace) for trace in event.workflow_trace
+                ],
+                workflow_denial_message=event.workflow_denial_message,
+                artifact_ids=event.artifact_ids,
+                created_at=event.created_at,
+            )
+            for event in audit_events
+        ]
+        return WorkflowSessionEventsResponse(
+            session_id=session.id,
+            event_count=len(events),
+            events=events,
+        )
+
     events: list[WorkflowSessionEvent] = []
     for index, message in enumerate(session.messages):
         workflow_trace = message.get("workflow_trace") or []
@@ -151,6 +191,39 @@ def get_session_workflow_events(session_id: str) -> WorkflowSessionEventsRespons
         event_count=len(events),
         events=events,
     )
+
+
+@app.get("/workflow-audit/events", response_model=WorkflowAuditEventsResponse)
+def list_workflow_audit_events(
+    session_id: str | None = Query(default=None),
+    user_id: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+) -> WorkflowAuditEventsResponse:
+    try:
+        audit_events = workflow_audit.list_events(
+            session_id=session_id,
+            user_id=user_id,
+            limit=limit,
+        )
+    except Exception as exc:
+        logger.warning("Failed to read workflow audit events: %s", exc)
+        raise HTTPException(status_code=503, detail="Workflow audit storage is unavailable") from exc
+
+    events = [
+        WorkflowSessionEvent(
+            id=event.id,
+            message_index=event.message_index or 0,
+            role=event.role,
+            content=event.content,
+            user_id=event.user_id,
+            workflow_trace=[WorkflowConstraintTrace(**trace) for trace in event.workflow_trace],
+            workflow_denial_message=event.workflow_denial_message,
+            artifact_ids=event.artifact_ids,
+            created_at=event.created_at,
+        )
+        for event in audit_events
+    ]
+    return WorkflowAuditEventsResponse(event_count=len(events), events=events)
 
 
 @app.post("/sessions/cleanup", response_model=SessionCleanupResponse)

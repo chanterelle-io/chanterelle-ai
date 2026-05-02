@@ -7,12 +7,12 @@ import httpx
 
 from services.agent.llm.base import (
     LLMProvider,
-    LLMResponse,
     Message,
     ToolCall,
     ToolDefinition,
     ToolResult,
 )
+from services.agent.audit import WorkflowAuditStore
 from services.agent.session import Session, SessionStore
 from services.agent.tools.sql_query import SQL_QUERY_TOOL
 from services.agent.tools.python_transform import PYTHON_TRANSFORM_TOOL
@@ -20,6 +20,7 @@ from services.agent.tools.inspect_artifact import INSPECT_ARTIFACT_TOOL
 from services.agent.tools.check_job import CHECK_JOB_STATUS_TOOL
 from services.agent.tools.pin_artifact import PIN_ARTIFACT_TOOL
 from services.agent.tools.unpin_artifact import UNPIN_ARTIFACT_TOOL
+from services.agent.tools.skill_guidance import GET_SKILL_GUIDANCE_TOOL
 from shared.contracts.connection import ConnectionRecord
 from shared.contracts.execution import (
     ExecutionRequest,
@@ -53,9 +54,11 @@ class Orchestrator:
     def __init__(self, llm: LLMProvider):
         self.llm = llm
         self.sessions = SessionStore()
+        self.workflow_audit = WorkflowAuditStore()
 
     async def handle_message(self, session_id: str, user_message: str, user_id: str | None = None) -> dict:
         session = self.sessions.get_or_create(session_id)
+        audit_start_index = len(session.messages)
 
         # Resolve topic context if user_id is provided
         topic_context = None
@@ -95,13 +98,15 @@ class Orchestrator:
             INSPECT_ARTIFACT_TOOL,
             PIN_ARTIFACT_TOOL,
             UNPIN_ARTIFACT_TOOL,
+            GET_SKILL_GUIDANCE_TOOL,
             CHECK_JOB_STATUS_TOOL,
         ]
         if topic_context and topic_context.allowed_tool_names:
-            # Always include check_job_status regardless of topic profile
+            # Always include platform meta-tools regardless of topic profile.
             tools = [
                 t for t in all_tools
-                if t.name in topic_context.allowed_tool_names or t.name == "check_job_status"
+                if t.name in topic_context.allowed_tool_names
+                or t.name in {"check_job_status", "get_skill_guidance"}
             ]
         else:
             tools = all_tools
@@ -160,6 +165,7 @@ class Orchestrator:
                     preferred_tool_names=preferred_tool_names,
                     active_policy_ids=active_policy_ids,
                     workflow_trace=workflow_trace,
+                    skills=skills,
                 )
                 tool_results.append(ToolResult(tool_call_id=tc.id, content=result_text))
                 if artifact_id:
@@ -197,6 +203,16 @@ class Orchestrator:
 
         # Persist session state
         self.sessions.save(session)
+        try:
+            self.workflow_audit.record_session_messages(
+                session_id=session.id,
+                user_id=user_id,
+                messages=session.messages,
+                start_index=audit_start_index,
+                artifact_ids=new_artifact_ids,
+            )
+        except Exception as exc:
+            logger.warning("Failed to record workflow audit events for session %s: %s", session.id, exc)
 
         return {
             "session_id": session_id,
@@ -217,6 +233,7 @@ class Orchestrator:
         preferred_tool_names: list[str] | None = None,
         active_policy_ids: list[str] | None = None,
         workflow_trace: list[dict[str, object]] | None = None,
+        skills: list[SkillRecord] | None = None,
     ) -> tuple[str, str | None, bool]:
         if tool_call.name == "query_sql_source":
             return await self._execute_sql_query(
@@ -248,6 +265,8 @@ class Orchestrator:
             return await self._execute_unpin_artifact(session, tool_call.input)
         if tool_call.name == "check_job_status":
             return await self._execute_check_job_status(session, tool_call.input)
+        if tool_call.name == "get_skill_guidance":
+            return self._execute_get_skill_guidance(tool_call.input, skills or [])
         return f"Unknown tool: {tool_call.name}", None, False
 
     async def _execute_sql_query(
@@ -568,6 +587,76 @@ class Orchestrator:
         return (
             f"Job '{job_id}' status: {status}.\n\nLogs:\n{logs_str}"
         ), None, False
+
+    def _execute_get_skill_guidance(
+        self,
+        tool_input: dict,
+        skills: list[SkillRecord],
+    ) -> tuple[str, str | None, bool]:
+        requested = str(tool_input.get("skill_name", "")).strip().lower()
+        if not requested:
+            return "Please provide a skill_name to fetch guidance for.", None, False
+
+        skill = self._find_skill(requested, skills)
+        if not skill:
+            active_names = ", ".join(sorted(skill.name for skill in skills)) or "none"
+            return (
+                f"Skill '{tool_input.get('skill_name', '')}' is not active for this turn. "
+                f"Active skills: {active_names}."
+            ), None, False
+
+        return self._format_skill_guidance(skill), None, False
+
+    def _find_skill(self, requested: str, skills: list[SkillRecord]) -> SkillRecord | None:
+        for skill in skills:
+            candidates = {
+                skill.id.lower(),
+                skill.name.lower(),
+            }
+            if skill.title:
+                candidates.add(skill.title.lower())
+            if requested in candidates:
+                return skill
+        return None
+
+    def _format_skill_guidance(self, skill: SkillRecord) -> str:
+        instructions = skill.instructions
+        parts = [
+            f"## Skill Guidance: {skill.title or skill.name}",
+            f"Name: {skill.name}",
+            f"Category: {skill.category.value}",
+            "",
+            instructions.summary,
+        ]
+
+        if instructions.detailed_markdown:
+            parts.extend(["", instructions.detailed_markdown])
+
+        if instructions.recommended_steps:
+            parts.append("")
+            parts.append("Recommended steps:")
+            for step in instructions.recommended_steps:
+                parts.append(f"- {step}")
+
+        if instructions.dos:
+            parts.append("")
+            parts.append("Do:")
+            for item in instructions.dos:
+                parts.append(f"- {item}")
+
+        if instructions.donts:
+            parts.append("")
+            parts.append("Don't:")
+            for item in instructions.donts:
+                parts.append(f"- {item}")
+
+        if instructions.output_expectations:
+            parts.append("")
+            parts.append("Expected output:")
+            for item in instructions.output_expectations:
+                parts.append(f"- {item}")
+
+        return "\n".join(parts)
 
     async def _get_artifact_summary(self, artifact_id: str) -> str:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -912,6 +1001,7 @@ class Orchestrator:
             "- Use the inspect_artifact tool to look at sample rows or column details of an existing artifact.",
             "- Use the pin_artifact tool when the user wants to keep an artifact available for later.",
             "- Use the unpin_artifact tool when the user wants to remove that cleanup protection.",
+            "- Use get_skill_guidance when an active skill appears relevant and you need its detailed instructions.",
             "- Give artifacts clear, descriptive snake_case names.",
             "- After getting results, summarize what was found.",
             "- You can reference prior artifacts by name when the user asks follow-up questions.",
@@ -927,26 +1017,16 @@ class Orchestrator:
         if skills:
             parts.append("")
             parts.append("## Active skills")
+            parts.append(
+                "Only summaries are shown here. Use get_skill_guidance with the skill name "
+                "when you need detailed steps, dos/donts, or output expectations."
+            )
             for skill in skills:
-                parts.append(f"### {skill.title or skill.name} ({skill.category.value})")
-                parts.append(skill.instructions.summary)
-                if skill.instructions.recommended_steps:
-                    parts.append("Recommended steps:")
-                    for step in skill.instructions.recommended_steps:
-                        parts.append(f"  - {step}")
-                if skill.instructions.dos:
-                    parts.append("Do:")
-                    for do in skill.instructions.dos:
-                        parts.append(f"  - {do}")
-                if skill.instructions.donts:
-                    parts.append("Don't:")
-                    for dont in skill.instructions.donts:
-                        parts.append(f"  - {dont}")
-                if skill.instructions.output_expectations:
-                    parts.append("Expected output:")
-                    for exp in skill.instructions.output_expectations:
-                        parts.append(f"  - {exp}")
-                parts.append("")
+                title = skill.title or skill.name
+                parts.append(
+                    f"- **{skill.name}** ({skill.category.value}; title: {title}): "
+                    f"{skill.instructions.summary}"
+                )
 
         if workflows:
             parts.append("")

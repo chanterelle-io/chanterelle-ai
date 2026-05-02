@@ -174,3 +174,21 @@ CREATE TABLE IF NOT EXISTS jobs (
 
 CREATE INDEX IF NOT EXISTS idx_jobs_session ON jobs(session_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+
+-- Workflow audit log
+CREATE TABLE IF NOT EXISTS workflow_audit_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id VARCHAR(255) NOT NULL,
+    user_id VARCHAR(255),
+    message_index INTEGER,
+    role VARCHAR(50) NOT NULL,
+    content TEXT NOT NULL DEFAULT '',
+    workflow_trace JSONB NOT NULL DEFAULT '[]',
+    workflow_denial_message TEXT,
+    artifact_ids JSONB NOT NULL DEFAULT '[]',
+    metadata JSONB NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_workflow_audit_session ON workflow_audit_events(session_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_workflow_audit_user ON workflow_audit_events(user_id, created_at);

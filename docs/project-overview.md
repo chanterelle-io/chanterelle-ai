@@ -23,6 +23,7 @@ Analytics Agent Platform — session-based analytical workspace where a user int
 - Artifact retention is session-scoped by default: TTLs, pinning, quota accounting, and eviction are enforced in the Artifact Service
 - Agent picks tools/intent; execution manager picks runtime/mode
 - Skills (guidance) are separate from tools (actions)
+- Active skill summaries are prompt-visible, while detailed skill instructions are fetched on demand with `get_skill_guidance`
 - Workflows provide higher-level multi-step guidance on top of skills
 - Credentials injected just-in-time, never exposed to agent
 - LLM provider is abstracted (`LLMProvider` ABC → `ClaudeProvider` impl)
@@ -36,7 +37,8 @@ Analytics Agent Platform — session-based analytical workspace where a user int
 - `/chat` responses now expose matched workflow constraints through `workflow_trace`
 - `/chat` responses now also surface deterministic workflow-constraint denial messages when a requested tool or runtime violates the matched workflow
 - `GET /sessions/{id}` now exposes persisted message history including workflow traces and workflow denial messages
-- `GET /sessions/{id}/workflow-events` now exposes a filtered workflow-audit view over that persisted session history
+- `GET /sessions/{id}/workflow-events` now exposes a filtered workflow-audit view backed by dedicated workflow audit storage
+- `GET /workflow-audit/events` exposes recent workflow audit events filtered by session or user
 - Deferred execution: server-side query analysis triggers background jobs for large/unbounded queries
 - Policy conditions are server-side only — agent hints are optional fallback, not the source of truth
 - Sessions persisted in Postgres (messages + artifact refs as JSONB) with expiry and cleanup metadata
@@ -51,6 +53,8 @@ Analytics Agent Platform — session-based analytical workspace where a user int
 - `make migrate-phase6` — add artifact retention and session lifecycle fields, and backfill seeded topic tool permissions
 - `make migrate-phase7` — add workflow registry support to existing DB
 - `make migrate-phase8` — add topic-profile workflow allowlists to existing DB
+- `make migrate-workflow-audit` — add dedicated workflow audit event storage to existing DB
+- `make smoke-mvp` — run the repeatable MVP smoke suite against the live local services
 - `make artifact` / `make runtime-sql` / `make runtime-python` / `make execution` / `make agent` — start each service
 - `make infra-down` — stop infrastructure
 
